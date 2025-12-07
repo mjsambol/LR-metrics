@@ -15,6 +15,8 @@ Build the image:
 docker build -t lrmetrics:latest .
 ```
 
+Or use an already available build from [Docker hub](https://hub.docker.com/repository/docker/msambol/lr-metrics/general) e.g. [msambol/lrmetrics:20251207](https://hub.docker.com/repository/docker/msambol/lr-metrics/tags/20251207/sha256-069637ed8c3e342030aa17fc1e9bc34252708acd40a5f0018aa446fd0fbfee6e)
+
 Run the container (recommended):
 
 ```bash
@@ -26,6 +28,9 @@ docker run \
 	-v $(pwd)/lrmetrics_data:/data \
 	lrmetrics:latest
 ```
+
+Replace `lrmetrics:latest` with the appropriate image reference if not using a locally built image.
+
 
 - `FLASK_SECRET` secures the web session. Always set it in production.
 - The mounted volume keeps your configuration and downloaded bundles between container restarts.
@@ -39,27 +44,23 @@ Master password and data security
 
 Kubernetes deployment
 ---------------------
-Below manifests are provided under `tools/LRmetrics/kubernetes/` to deploy LRmetrics. You will need an image in a registry accessible by your cluster (replace `your-registry/lrmetrics:TAG`).
+Below manifests are provided under `tools/LRmetrics/kubernetes/` to deploy LRmetrics. 
+You will need an image in a registry accessible by your cluster - see explanation above about building locally or using a build available in Docker Hub, and replace `your-registry/lrmetrics:TAG`.
 
-1) Build and push the image:
-
-```bash
-docker build -t your-registry/lrmetrics:TAG .
-docker push your-registry/lrmetrics:TAG
-```
-
-2) Create a namespace (optional):
+1) Create a namespace (optional):
 
 ```bash
 kubectl apply -f kubernetes/namespace.yaml
 ```
 
-3) Create a Secret with a strong `FLASK_SECRET`:
+2) Create a Secret with a strong `FLASK_SECRET`:
 
 ```bash
 kubectl -n lrmetrics create secret generic lrmetrics-secret \
 	--from-literal=FLASK_SECRET=$(openssl rand -hex 32)
 ```
+
+3) Update deployment.yaml with the appropriate image reference. 
 
 4) Apply storage, deployment, and service:
 
