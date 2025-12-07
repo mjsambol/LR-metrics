@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lrmetrics
+  namespace: lrmetrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lrmetrics
+  template:
+    metadata:
+      labels:
+        app: lrmetrics
+    spec:
+      containers:
+        - name: lrmetrics
+          image: your-registry/lrmetrics:TAG
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+          env:
+            - name: FLASK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: lrmetrics-secret
+                  key: FLASK_SECRET
+            - name: DATA_DIR
+              value: "/data"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: lrmetrics-data

@@ -1,0 +1,91 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h3>Retrieval</h3>
+  <div class="position-relative" style="min-width: 280px; text-align: right;">
+    <form id="retrieveForm" method="post" style="display: inline;">
+      <button id="retrieveBtn" class="btn btn-primary">Fetch Latest From All Servers</button>
+    </form>
+    <div id="loadingIndicator" class="position-absolute end-0" style="top: 50%; transform: translateY(-50%); display:none;">
+      <span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+      <span class="ms-1">Fetching diagnostics…</span>
+    </div>
+  </div>
+  <script>
+    (function(){
+      const form = document.getElementById('retrieveForm');
+      const btn = document.getElementById('retrieveBtn');
+      const loading = document.getElementById('loadingIndicator');
+      if (form) {
+        form.addEventListener('submit', function(){
+          if (btn) { btn.style.visibility = 'hidden'; btn.disabled = true; }
+          if (loading) loading.style.display = 'block';
+        });
+      }
+      // When page reloads after POST completes, button becomes visible again
+    })();
+  </script>
+</div>
+
+<div class="alert alert-info py-2">
+  Diagnostic bundles are stored locally to the LRmetrics application. They are not automatically transmitted to any system or entity. Please download them and transfer them manually.
+  </div>
+
+{% if results and results|length > 0 %}
+  <div class="mb-3">
+    <h5 class="mb-2">Fetch Summary</h5>
+    <ul class="list-group">
+    {% for r in results %}
+      {% set name = bundle_labels.get(r.server, r.server) if bundle_labels else r.server %}
+      {% if r.error %}
+        <li class="list-group-item">
+          <div class="d-flex justify-content-between align-items-center">
+            <div>
+              {{ name }}
+              {% if r['status'] is defined %}
+                <span class="text-muted ms-2">(status {{ r['status'] }})</span>
+              {% endif %}
+            </div>
+            <span class="badge bg-danger">Failed</span>
+          </div>
+          {% if r['reason'] is defined and r['reason'] %}
+            <div class="mt-1 small text-muted">{{ r['reason'] }}</div>
+          {% endif %}
+          <details class="mt-2">
+            <summary class="small">Debug details</summary>
+            <pre class="small bg-dark text-light p-2 border rounded">{{ r | tojson }}</pre>
+          </details>
+        </li>
+      {% elif r.diagnostics == 'COMPLETED' %}
+        <li class="list-group-item d-flex justify-content-between align-items-center">
+          {{ name }}
+          <span class="badge bg-success">Completed</span>
+        </li>
+      {% else %}
+        <li class="list-group-item d-flex justify-content-between align-items-center">
+          {{ name }}
+          <span class="badge bg-secondary">Started</span>
+        </li>
+      {% endif %}
+    {% endfor %}
+    </ul>
+  </div>
+{% endif %}
+
+
+<div class="d-flex justify-content-between align-items-center mb-2">
+  <h5 class="mb-0">Available Diagnostics Bundles</h5>
+  <a class="btn btn-outline-secondary btn-sm" href="/export/bundles">Download all latest bundles as one zip</a>
+</div>
+{% for sid, files in bundles.items() %}
+  <div class="mb-2">
+    <strong>{{ bundle_labels.get(sid, sid) }}</strong>
+    <ul>
+    {% for f in files[:10] %}
+      <li><a href="/bundles/{{sid}}/{{f}}">{{f}}</a></li>
+    {% endfor %}
+    </ul>
+  </div>
+{% endfor %}
+
+{% endblock %}

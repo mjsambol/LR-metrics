@@ -1,0 +1,21 @@
+{% extends 'base.html' %}
+{% block content %}
+<h3>Display Summaries</h3>
+{% for s in summaries %}
+  <div class="card mb-3">
+    <div class="card-body">
+      <h5 class="card-title">{{ s.server }}</h5>
+      <p class="card-text">Latest: {{ s.latest }} | Size: {{ s.size if s.size is defined else 'n/a' }}</p>
+      {% if s.top_keys %}
+        <p><strong>Top keys:</strong> {{ s.top_keys|join(', ') }}</p>
+      {% endif %}
+      {% if s.items %}
+        <p><strong>Items:</strong> {{ s.items }}</p>
+      {% endif %}
+      {% if s.preview %}
+        <pre class="small">{{ s.preview }}</pre>
+      {% endif %}
+    </div>
+  </div>
+{% endfor %}
+{% endblock %}

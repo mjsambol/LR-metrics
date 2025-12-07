@@ -1,0 +1,68 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="row">
+  <div class="col-md-8">
+    <h3>Edit {{ server.name }}</h3>
+    <form id="edit-server-form" method="post">
+      <div class="mb-3">
+        <label class="form-label">Configuration Name</label>
+        <input name="name" class="form-control" value="{{ server.name }}">
+      </div>
+      <div class="mb-3">
+        <label class="form-label">Server URL</label>
+        <input name="url" class="form-control" value="{{ server.url }}">
+      </div>
+      <div class="mb-3">
+        <label class="form-label">Admin Email</label>
+        <input name="email" class="form-control" value="{{ server.email }}">
+      </div>
+      <div class="mb-3">
+        <label class="form-label">Password</label>
+        <input name="password" type="password" class="form-control" placeholder="Leave blank to keep existing password">
+      </div>
+      <div class="d-flex gap-2">
+        <button id="btn-edit-test" type="button" class="btn btn-outline-secondary">Test</button>
+        <button id="btn-edit-save" class="btn btn-primary" disabled>Save</button>
+        <a class="btn btn-secondary" href="{{ url_for('setup', src=src) }}">Cancel</a>
+        <span id="edit-test-status" class="align-self-center ms-2"></span>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+document.addEventListener('DOMContentLoaded', function(){
+  const testBtn = document.getElementById('btn-edit-test');
+  const saveBtn = document.getElementById('btn-edit-save');
+  const statusEl = document.getElementById('edit-test-status');
+  testBtn?.addEventListener('click', async function(){
+    const url = document.querySelector('input[name="url"]').value.trim();
+    const email = document.querySelector('input[name="email"]').value.trim();
+    const password = document.querySelector('input[name="password"]').value;
+    statusEl.innerHTML = '';
+    if(!/^https?:\/\//i.test(url)){ alert('URL must start with http:// or https://'); return; }
+    if(!/[^@]+@[^@]+\.[^@]+/.test(email)){ alert('Invalid email'); return; }
+    try{
+      const fd = new FormData(); fd.append('url', url); fd.append('email', email); fd.append('password', password);
+      const res = await fetch(`/setup/test-params/{{src}}`, {method:'POST', body: fd});
+      const j = await res.json();
+      if(j.ok){
+        let parts = [];
+        if(j.version) parts.push(`<small class="text-success ms-1">${j.version}</small>`);
+        if(j.auth){
+          if(j.auth.ok) parts.push(`<span class="badge bg-success ms-2">Auth OK</span>`);
+          else parts.push(`<span class="badge bg-warning ms-2">Auth Failed</span>`);
+        }
+        statusEl.innerHTML = `<span class="badge bg-success">OK</span> ${parts.join(' ')}`;
+        // Only enable Save when authentication also succeeded
+        saveBtn.disabled = !(j.auth && j.auth.ok);
+      } else {
+        statusEl.innerHTML = `<span class="badge bg-danger">Fail</span> <small class="text-danger ms-1">${j.info||j.status||j.error||''}</small>`;
+        saveBtn.disabled = true;
+      }
+    }catch(e){ statusEl.innerHTML = `<span class="badge bg-danger">Error</span> <small class="text-danger ms-1">${e}</small>`; saveBtn.disabled = true; }
+  });
+  // prevent premature save
+  document.getElementById('edit-server-form')?.addEventListener('submit', function(ev){ if(saveBtn.disabled){ ev.preventDefault(); alert('Please run Test and ensure it passes before saving.'); } });
+});
+</script>
+{% endblock %}

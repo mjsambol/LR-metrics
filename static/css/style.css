@@ -1,0 +1,10 @@
+:root{
+  --lr-blue: #0055ff;
+  --lr-accent: #ff6a00;
+  --lr-bg: #f7f9fc;
+  --lr-font: 'Poppins', sans-serif;
+}
+body{font-family:var(--lr-font);background:var(--lr-bg)}
+.lr-navbar{background:linear-gradient(90deg,var(--lr-blue),#1f7bff)}
+.navbar-brand{font-weight:700}
+pre{background:#0f1724;color:#e6eef8;padding:12px;border-radius:6px}
