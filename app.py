@@ -1,11 +1,8 @@
 import os
-import sys
 import json
-import uuid
 import hashlib
 import zipfile
 import io
-import re
 from datetime import datetime
 
 from flask import (
@@ -484,9 +481,6 @@ def setup_edit(src, server_id):
     return render_template('setup_edit.html', src=src, server=s)
 
 
- 
-
-
 @app.route('/setup/delete/<src>/<server_id>', methods=['POST'])
 def setup_delete(src, server_id):
     servers = get_servers_for(src)
@@ -767,8 +761,6 @@ def export_bundles():
     mem.seek(0)
     ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
     return send_file(mem, as_attachment=True, download_name=f"lrmetrics_bundles_{ts}.zip")
-
-# moved GitHub report helpers into github_api.py
 
 
 if __name__ == '__main__':
