@@ -23,6 +23,7 @@ app.secret_key = os.environ.get('FLASK_SECRET', 'dev-secret')
 DATA_DIR = os.environ.get('DATA_DIR', '/data')
 os.makedirs(DATA_DIR, exist_ok=True)
 CONFIG_PATH = os.path.join(DATA_DIR, 'servers.json')
+PROGRESS_PATH = os.path.join(DATA_DIR, 'progress.json')
 @app.before_request
 def require_master_password():
     # Allow unauthenticated access only to landing page, password set, logout, and static assets
@@ -72,8 +73,6 @@ def decrypt_password(stored: str) -> str:
     return stored
 
 
-
-
 def load_config():
     # config is a dict of source_type -> list of servers
     if not os.path.exists(CONFIG_PATH):
@@ -97,8 +96,6 @@ def get_servers_for(src_type):
     return config.get(src_type, [])
 
 
-# removed duplicate encryption helpers (defined earlier)
-
 def set_servers_for(src_type, servers):
     # Remove transient auth flags before saving; store passwords (possibly encrypted)
     cleaned = []
@@ -110,9 +107,6 @@ def set_servers_for(src_type, servers):
     config = load_config()
     config[src_type] = cleaned
     save_config(config)
-
-
-# No migration logic: existing data is used as-is
 
 
 def slugify(name: str) -> str:
@@ -138,60 +132,21 @@ def server_id_from_name(name: str, existing_ids=None) -> str:
     return sid
 
 
-def test_connection(server):
-    try:
-        # GET the /version endpoint
-        base = server.get('url', '').rstrip('/')
-        url = f"{base}/version"
-        # Tolerate self-signed certificates
-        resp = requests.get(url, timeout=10, verify=False)
-        text = resp.text.strip()
-        if resp.status_code == 200:
-            # remove leading 'Lightrun Server' if present
-            ver = re.sub(r'(?i)^\s*Lightrun Server\s*', '', text).strip()
-            # attempt authentication
-            auth_result = {'ok': False}
-            try:
-                auth_url = f"{base}/api/authenticate"
-                auth_payload = {"email": server.get('email', ''), "password": server.get('password', ''), "rememberMe": True}
-                auth_resp = requests.post(auth_url, json=auth_payload, timeout=10, verify=False)
-                # Collect diagnostics
-                diag = {
-                    'status': auth_resp.status_code,
-                    'url': auth_url,
-                    'payload': {k: (v if k != 'password' else '***') for k, v in auth_payload.items()},
-                    'headers': dict(auth_resp.headers),
-                }
-                text_snippet = ''
-                body_json = None
-                try:
-                    body_json = auth_resp.json()
-                except Exception as je:
-                    diag['json_error'] = str(je)
-                    text_snippet = (auth_resp.text or '')[:500]
-                if body_json is None:
-                    diag['body'] = text_snippet
-                else:
-                    diag['body'] = body_json
-
-                if auth_resp.status_code == 200 and isinstance(body_json, dict) and 'id_token' in body_json:
-                    cookie_val = {'access_token': body_json.get('id_token')}
-                    auth_result = {'ok': True, 'cookie': cookie_val, 'diag': diag}
-                else:
-                    auth_result = {'ok': False, 'error': 'Authentication failed', 'diag': diag}
-            except Exception as e:
-                auth_result = {'ok': False, 'error': str(e)}
-            return True, resp.status_code, {'version': ver, 'auth': auth_result}
-        return False, resp.status_code, text[:400]
-    except Exception as e:
-        return False, None, str(e)
-
-
-# (Removed corrupted duplicate encryption helper block)
-
-
-
-# No encryption validation or migrations
+from lightrun_api import (
+    test_connection,
+    authenticate as lr_authenticate,
+    start_diagnostics as lr_start_diagnostics,
+    poll_diagnostics_status as lr_poll_status,
+    download_diagnostics as lr_download,
+    diagnostics_request_body as lr_diag_body,
+)
+from github_api import (
+    repo_exists as gh_repo_exists,
+    list_commits as gh_list_commits,
+    commit_details as gh_commit_details,
+    store_report as gh_store_report,
+    get_latest_report_generated_at as gh_latest_generated_at,
+)
 
 
 def store_retrieved(server, content, ts=None):
@@ -243,6 +198,42 @@ def get_last_retrieved_timestamp():
     # return formatted local timestamp
     return datetime.fromtimestamp(latest_ts).strftime('%Y-%m-%d %H:%M:%S')
 
+def _write_progress(source: str, current: str = '', completed=None, total: int = 0):
+    try:
+        if completed is None:
+            completed = []
+        state = {
+            'source': source,
+            'current': current,
+            'completed': completed,
+            'total': total,
+            'ts': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        }
+        with open(PROGRESS_PATH, 'w') as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+def _clear_progress():
+    try:
+        if os.path.exists(PROGRESS_PATH):
+            os.remove(PROGRESS_PATH)
+    except Exception:
+        pass
+
+@app.route('/progress/<source>')
+def progress(source):
+    try:
+        if not os.path.exists(PROGRESS_PATH):
+            return jsonify({'source': source, 'current': '', 'completed': [], 'total': 0}), 200
+        with open(PROGRESS_PATH, 'r') as f:
+            state = json.load(f)
+        if state.get('source') != source:
+            return jsonify({'source': source, 'current': '', 'completed': [], 'total': 0}), 200
+        return jsonify(state)
+    except Exception:
+        return jsonify({'source': source, 'current': '', 'completed': [], 'total': 0}), 200
+
 
 @app.route('/')
 def index():
@@ -286,51 +277,76 @@ def setup():
     servers = get_servers_for(src)
     if request.method == 'POST':
         if not session.get('LR_PWD'):
-            flash('Set the master password on the home page before saving servers.', 'danger')
+            flash('Set the master password on the home page before saving.', 'danger')
             return redirect(url_for('setup', src=src))
-        # creation of a new server for the selected source
-        name = request.form.get('name')
-        url = request.form.get('url')
-        email = request.form.get('email')
-        password = request.form.get('password')
-        if not name or not url or not email:
-            flash('Name, URL and Email are required', 'danger')
-            return redirect(url_for('setup', src=src))
-        existing_ids = [s.get('id') for s in servers]
-        sid = server_id_from_name(name, existing_ids)
-        server = {'id': sid, 'name': name, 'url': url.rstrip('/'), 'email': email, 'password': password}
-        # Server-side authentication test required before saving
-        server_for_test = {'id': sid, 'name': name, 'url': url.rstrip('/'), 'email': email, 'password': password}
-        ok, status, info = test_connection(server_for_test)
-        if not ok:
-            flash(f'Connection test failed: {info}', 'danger')
-            return redirect(url_for('setup', src=src))
-        # require successful authentication
-        if isinstance(info, dict):
-            auth = info.get('auth') or {}
-            if not auth.get('ok'):
-                diag = auth.get('diag') or {}
-                detail = f"status={diag.get('status')} url={diag.get('url')}"
-                body = diag.get('body')
-                if isinstance(body, str):
-                    detail += f" body_snippet={body[:120]}"
-                elif isinstance(body, dict):
-                    # show keys for quick hint
-                    detail += f" body_keys={list(body.keys())}"
-                flash(f'Authentication failed — server not saved ({detail})', 'danger')
+        if src == 'lightrun':
+            # creation of a new Lightrun server
+            name = request.form.get('name')
+            url = request.form.get('url')
+            email = request.form.get('email')
+            password = request.form.get('password')
+            if not name or not url or not email:
+                flash('Name, URL and Email are required', 'danger')
                 return redirect(url_for('setup', src=src))
-        # store password encrypted with LRMETRICS_PWD
-        server['password'] = encrypt_password(password)
-        servers.append(server)
-        set_servers_for(src, servers)
-        # store version if available (do not persist auth_ok flags)
-        if isinstance(info, dict):
-            ver = info.get('version')
-            if ver:
-                server['version'] = ver
-        set_servers_for(src, servers)
-        flash('Server saved', 'success')
-        return redirect(url_for('setup', src=src))
+            existing_ids = [s.get('id') for s in servers]
+            sid = server_id_from_name(name, existing_ids)
+            server = {'id': sid, 'name': name, 'url': url.rstrip('/'), 'email': email, 'password': password}
+            # Test connectivity and auth
+            ok, status, info = test_connection({'id': sid, 'name': name, 'url': url.rstrip('/'), 'email': email, 'password': password})
+            if not ok:
+                flash(f'Connection test failed: {info}', 'danger')
+                return redirect(url_for('setup', src=src))
+            if isinstance(info, dict):
+                auth = info.get('auth') or {}
+                if not auth.get('ok'):
+                    diag = auth.get('diag') or {}
+                    detail = f"status={diag.get('status')} url={diag.get('url')}"
+                    body = diag.get('body')
+                    if isinstance(body, str):
+                        detail += f" body_snippet={body[:120]}"
+                    elif isinstance(body, dict):
+                        detail += f" body_keys={list(body.keys())}"
+                    flash(f'Authentication failed — server not saved ({detail})', 'danger')
+                    return redirect(url_for('setup', src=src))
+            server['password'] = encrypt_password(password)
+            servers.append(server)
+            set_servers_for(src, servers)
+            if isinstance(info, dict):
+                ver = info.get('version')
+                if ver:
+                    server['version'] = ver
+            set_servers_for(src, servers)
+            flash('Server saved', 'success')
+            return redirect(url_for('setup', src=src))
+        elif src == 'github':
+            # creation of a new GitHub repository config
+            name = request.form.get('name', '').strip()
+            full_name = request.form.get('full_name', '').strip()  # owner/repo
+            token = request.form.get('token', '')
+            api_base = (request.form.get('api_base') or '').strip()
+            if not name or not full_name:
+                flash('Name and Repository (owner/repo) are required', 'danger')
+                return redirect(url_for('setup', src=src))
+            ok, status, info = gh_repo_exists(full_name, token, api_base or None)
+            if not ok:
+                snippet = ''
+                try:
+                    snippet = (info if isinstance(info, str) else str(info))[:160]
+                except Exception:
+                    snippet = ''
+                flash(f'Repository validation failed (status {status}). {snippet}', 'danger')
+                return redirect(url_for('setup', src=src))
+            existing_ids = [s.get('id') for s in servers]
+            sid = server_id_from_name(name, existing_ids)
+            repo = {'id': sid, 'name': name, 'full_name': full_name, 'api_base': api_base}
+            repo['token'] = encrypt_password(token) if token else ''
+            servers.append(repo)
+            set_servers_for(src, servers)
+            flash('Repository saved', 'success')
+            return redirect(url_for('setup', src=src))
+        else:
+            flash(f'Source {src} is not supported yet.', 'warning')
+            return redirect(url_for('setup', src=src))
     return render_template('setup.html', src=src, servers=servers)
 
 
@@ -366,6 +382,15 @@ def setup_test_params(src):
     else:
         # Flask's request.form is an ImmutableMultiDict
         data = request.form.to_dict()
+
+    if src == 'github':
+        full_name = (data.get('full_name') or '').strip()
+        token = (data.get('token') or '').strip()
+        api_base = (data.get('api_base') or '').strip() or None
+        if not full_name:
+            return jsonify({'ok': False, 'error': 'repository (owner/repo) missing'}), 400
+        ok, status, info = gh_repo_exists(full_name, token, api_base)
+        return jsonify({'ok': ok, 'status': status, 'info': info if ok else info}), (200 if ok else (status or 500))
 
     url = (data.get('url') or data.get('server_url') or '').strip()
     email = (data.get('email') or data.get('username') or '').strip()
@@ -459,6 +484,9 @@ def setup_edit(src, server_id):
     return render_template('setup_edit.html', src=src, server=s)
 
 
+ 
+
+
 @app.route('/setup/delete/<src>/<server_id>', methods=['POST'])
 def setup_delete(src, server_id):
     servers = get_servers_for(src)
@@ -471,12 +499,18 @@ def setup_delete(src, server_id):
 @app.route('/retrieve', methods=['GET', 'POST'])
 def retrieve():
     servers = get_servers_for('lightrun')
+    repos = get_servers_for('github')
     results = []
+    github_results = []
     if request.method == 'POST':
         if not session.get('LR_PWD'):
             flash('Set the master password on the home page before retrieval.', 'danger')
             return redirect(url_for('retrieve'))
         failures = 0
+        github_failures = 0
+        total_overall = len(servers) + len(repos)
+        completed_ids = []
+        _write_progress('lightrun', current='', completed=[], total=total_overall)
         for s in servers:
             try:
                 base = s['url'].rstrip('/')
@@ -489,78 +523,47 @@ def retrieve():
                         return redirect(url_for('index'))
                 else:
                     pwd = stored or ''
+                # mark current
+                _write_progress('lightrun', current=(s.get('name') or s.get('id')), completed=completed_ids, total=len(servers))
                 # authenticate to get cookie
-                auth_resp = requests.post(f"{base}/api/authenticate", json={"email": email, "password": pwd, "rememberMe": True}, timeout=15, verify=False)
-                if auth_resp.status_code != 200:
+                auth = lr_authenticate(base, email, pwd, timeout=15, verify=False)
+                if not auth.get('ok'):
+                    diag = auth.get('diag') or {}
+                    detail_body = diag.get('body')
+                    if not isinstance(detail_body, str):
+                        detail_body = ''
                     results.append({
                         'server': s.get('id'),
-                        'error': f"Auth failed: {auth_resp.status_code}",
-                        'detail': (auth_resp.text or '')[:500],
-                        'headers': dict(auth_resp.headers)
+                        'error': f"Auth failed: {diag.get('status')}",
+                        'detail': (detail_body or '')[:500],
+                        'headers': diag.get('headers') or {}
                     })
+                    completed_ids.append(s.get('name') or s.get('id'))
+                    _write_progress('lightrun', current='', completed=completed_ids, total=total_overall)
                     continue
-                auth_cookie = None
-                if "id_token" not in auth_resp.json():
-                    results.append({
-                        'server': s.get('id'),
-                        'error': "Auth cookie not found after authentication",
-                        'body_keys': list((auth_resp.json() or {}).keys()) if isinstance(auth_resp.json(), dict) else 'non-json'
-                    })
-                    continue
-                auth_cookie = {"access_token": auth_resp.json().get("id_token")}
-                # prepare diagnostics
-                body = {
-                    "diagnostics": [
-                        "KEYCLOAK","ENVIRONMENT_VARIABLES","FEATURE_TOGGLES","DB_TABLES_INFO","K8S_INFO",
-                        "INTEGRATIONS","LICENSES_INFO","USAGE_INFO","AGENTS","PLUGINS","ACTIONS_INFO",
-                        "COMPANY_SETTINGS","REPORT_CONFIG"
-                    ],
-                    "logCollectionSettings": {"useRandomClients": True},
-                    "shouldAnonymize": False,
-                    "reportDescription": f"{s.get('name','server')} - {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
-                }
-                diag_resp = requests.post(f"{base}/athena/diagnostics", json=body, cookies=auth_cookie or {}, timeout=20, verify=False)
-                if diag_resp.status_code != 200:
+                auth_cookie = auth.get('cookie') or {}
+                # prepare diagnostics via API helper
+                body = lr_diag_body(s.get('name','server'))
+                ok, st_code, reason = lr_start_diagnostics(base, auth_cookie, body, timeout=20, verify=False)
+                if not ok:
                     failures += 1
-                    snippet = ''
-                    try:
-                        snippet = diag_resp.text[:300]
-                    except Exception:
-                        snippet = ''
-                    results.append({'server': s.get('id'), 'error': "Diagnostics start failed", 'status': diag_resp.status_code, 'reason': snippet})
+                    results.append({'server': s.get('id'), 'error': "Diagnostics start failed", 'status': st_code, 'reason': reason})
+                    completed_ids.append(s.get('name') or s.get('id'))
+                    _write_progress('lightrun', current='', completed=completed_ids, total=total_overall)
                     continue
                 # poll status until COMPLETED
-                status_info = None
-                for _ in range(120):  # up to ~2 minutes
-                    st_resp = requests.get(f"{base}/athena/diagnostics/status", cookies=auth_cookie or {}, timeout=20, verify=False)
-                    if st_resp.status_code != 200:
-                        status_info = {'error': "Status failed", 'status': st_resp.status_code}
-                        break
-                    try:
-                        sj = st_resp.json()
-                    except Exception:
-                        status_info = {'error': 'Invalid status payload'}
-                        break
-                    if (sj.get('status') or '').upper() == 'COMPLETED':
-                        status_info = {'status': 'COMPLETED'}
-                        break
-                    cooldown = int(sj.get('cooldownMs') or 1000)
-                    # sleep ~1s regardless; do not block server excessively
-                    import time
-                    time.sleep(min(max(cooldown/1000.0, 0.5), 2.0))
-                if not status_info:
-                    status_info = {'status': 'TIMEOUT'}
+                status_info = lr_poll_status(base, auth_cookie, timeout=20, verify=False, max_iters=120)
                 # if completed, download the bundle
                 if status_info.get('status') == 'COMPLETED':
-                    dl_resp = requests.get(f"{base}/athena/diagnostics/download", cookies=auth_cookie or {}, timeout=60, verify=False)
-                    ctype = (dl_resp.headers.get('Content-Type') or '').lower()
-                    if dl_resp.status_code == 200:
+                    dl_status, dl_headers, dl_content = lr_download(base, auth_cookie, timeout=60, verify=False)
+                    ctype = (dl_headers.get('Content-Type') or '').lower()
+                    if dl_status == 200:
                         # Save regardless of content-type; browsers download zip immediately even without correct header
-                        path = store_diagnostics_zip(s, dl_resp.content)
+                        path = store_diagnostics_zip(s, dl_content)
                         results.append({'server': s.get('id'), 'diagnostics': 'COMPLETED', 'bundle': path, 'content_type': ctype})
                     else:
                         failures += 1
-                        results.append({'server': s.get('id'), 'diagnostics': 'COMPLETED', 'error': "Download failed", 'status': dl_resp.status_code})
+                        results.append({'server': s.get('id'), 'diagnostics': 'COMPLETED', 'error': "Download failed", 'status': dl_status})
                 else:
                     # status failure or timeout
                     failures += 1
@@ -568,13 +571,63 @@ def retrieve():
             except Exception as e:
                 results.append({'server': s.get('id'), 'error': str(e)})
                 failures += 1
-        if failures:
-            flash('Some servers failed during retrieval. Please check the master password and try again.', 'danger')
+            # mark completion of this server
+            completed_ids.append(s.get('name') or s.get('id'))
+            _write_progress('lightrun', current='', completed=completed_ids, total=total_overall)
+        # Process GitHub repos as part of unified retrieval
+        completed_repos = []
+        _write_progress('github', current='', completed=[], total=total_overall)
+        from datetime import timedelta
+        now = datetime.utcnow()
+        since_default = (now - timedelta(days=30)).isoformat(timespec='seconds') + 'Z'
+        for r in repos:
+            try:
+                token_stored = r.get('token') or ''
+                token = decrypt_password(token_stored) if token_stored else ''
+                full_name = r.get('full_name') or ''
+                api_base = (r.get('api_base') or '').strip() or None
+                # Determine since based on latest stored report timestamp if present; otherwise 30-day default
+                latest_generated_at = gh_latest_generated_at(r.get('id'), DATA_DIR)
+                since = latest_generated_at or r.get('last_checked') or since_default
+                _write_progress('github', current=(r.get('name') or full_name), completed=completed_repos, total=total_overall)
+                commits = gh_list_commits(full_name, token, since_iso=since, until_iso=now.isoformat(timespec='seconds') + 'Z', api_base=api_base)
+                repo_changes = []
+                for c in commits[:200]:
+                    sha = c.get('sha')
+                    date = ((c.get('commit') or {}).get('author') or {}).get('date')
+                    author_login = (c.get('author') or {}).get('login')
+                    author_name = ((c.get('commit') or {}).get('author') or {}).get('name')
+                    ok, st, body = gh_commit_details(full_name, sha, token, api_base=api_base)
+                    if not ok or not isinstance(body, dict):
+                        continue
+                    files = [f.get('filename') for f in (body.get('files') or []) if isinstance(f, dict) and f.get('filename')]
+                    repo_changes.append({'commit': sha, 'date': date, 'user': author_login or author_name or 'unknown', 'files': files})
+                # assemble report and store to filesystem
+                report = {'repo': r.get('name') or full_name, 'full_name': full_name, 'generated_at': now.isoformat(timespec='seconds') + 'Z', 'changes': repo_changes}
+                github_results.append(report)
+                gh_store_report(r, json.dumps(report), DATA_DIR)
+                r['last_checked'] = now.isoformat(timespec='seconds') + 'Z'
+            except Exception as e:
+                github_results.append({'repo': r.get('name') or r.get('full_name'), 'error': str(e)})
+                github_failures += 1
+            completed_repos.append(r.get('name') or full_name)
+            _write_progress('github', current='', completed=completed_repos, total=total_overall)
+        set_servers_for('github', repos)
+
+        if failures or github_failures:
+            flash('Communication with some servers failed. Check the Debug details below.', 'danger')
         else:
             flash('Retrieval finished', 'success')
+        _clear_progress()
         try:
             print("[LRmetrics] Retrieval results:")
             for r in results:
+                try:
+                    print(json.dumps(r, indent=2))
+                except Exception:
+                    print(str(r))
+            print("[LRmetrics] GitHub Retrieval results:")
+            for r in github_results:
                 try:
                     print(json.dumps(r, indent=2))
                 except Exception:
@@ -593,7 +646,22 @@ def retrieve():
         if os.path.exists(sdir):
             files = sorted(os.listdir(sdir), reverse=True)
         bundles[sid] = files
-    return render_template('retrieval.html', servers=servers, results=results, bundles=bundles, bundle_labels=bundle_labels)
+
+    # list latest github reports for display
+    gh_reports = {}
+    gh_labels = {}
+    gh_root = os.path.join(DATA_DIR, 'github_reports')
+    for r in repos:
+        rid = r['id']
+        gh_labels[rid] = r.get('name') or (r.get('full_name') or rid)
+        rdir = os.path.join(gh_root, rid)
+        files = []
+        if os.path.exists(rdir):
+            files = sorted([f for f in os.listdir(rdir) if f.endswith('.json')], reverse=True)
+        gh_reports[rid] = files
+
+    total_overall = len(servers) + len(repos)
+    return render_template('retrieval.html', servers=servers, results=results, bundles=bundles, bundle_labels=bundle_labels, github_results=github_results, gh_reports=gh_reports, gh_labels=gh_labels, total_overall=total_overall)
 
 
 @app.route('/display')
@@ -653,13 +721,24 @@ def serve_bundle(server_id, filename):
         return ("Not found", 404)
     return send_file(target, as_attachment=True, download_name=filename)
 
+@app.route('/gh_reports/<repo_id>/<path:filename>')
+def serve_gh_report(repo_id, filename):
+    # Serve stored GitHub report JSON from DATA_DIR/github_reports/<repo_id>
+    rdir = os.path.join(DATA_DIR, 'github_reports', repo_id)
+    target = os.path.join(rdir, filename)
+    if not os.path.exists(target):
+        return ("Not found", 404)
+    return send_file(target, as_attachment=True, download_name=filename)
+
 
 @app.route('/export/bundles')
 def export_bundles():
-    # Create a zip containing latest bundle for each server
+    # Create a zip containing latest bundle for each server and latest GitHub reports
     servers = get_servers_for('lightrun')
+    repos = get_servers_for('github')
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+        # Lightrun bundles
         root = os.path.join(DATA_DIR, 'diagnostics_bundles')
         for s in servers:
             sid = s.get('id')
@@ -671,10 +750,25 @@ def export_bundles():
             if not files:
                 continue
             latest = sorted(files, reverse=True)[0]
-            z.write(os.path.join(sdir, latest), arcname=f"{sname}/{latest}")
+            z.write(os.path.join(sdir, latest), arcname=f"lightrun/{sname}/{latest}")
+        # GitHub reports
+        gh_root = os.path.join(DATA_DIR, 'github_reports')
+        for r in repos:
+            rid = r.get('id')
+            rname = (r.get('name') or (r.get('full_name') or rid)).strip()
+            rdir = os.path.join(gh_root, rid)
+            if not os.path.exists(rdir):
+                continue
+            files = [f for f in os.listdir(rdir) if f.endswith('.json')]
+            if not files:
+                continue
+            latest = sorted(files, reverse=True)[0]
+            z.write(os.path.join(rdir, latest), arcname=f"github/{rname}/{latest}")
     mem.seek(0)
     ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
     return send_file(mem, as_attachment=True, download_name=f"lrmetrics_bundles_{ts}.zip")
+
+# moved GitHub report helpers into github_api.py
 
 
 if __name__ == '__main__':

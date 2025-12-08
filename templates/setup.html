@@ -81,9 +81,79 @@
           {% endif %}
         </div>
       </div>
+    {% elif src == 'github' %}
+      <div class="d-flex justify-content-between align-items-center">
+        <h3>GitHub Repositories</h3>
+      </div>
+      <div class="alert alert-info py-2">
+        Repository credentials (tokens) are stored encrypted by your master password, which is never stored. Only minimal metadata is fetched (commit author, date, and file names), never the diffs themselves.
+      </div>
+      <div class="row">
+        <div class="col-md-6">
+          <h5>Add Repository</h5>
+          <form id="add-gh-form" method="post">
+            <div class="mb-3">
+              <label class="form-label">Configuration Name</label>
+              <input id="gh-name" name="name" class="form-control" placeholder="e.g. platform-api">
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Repository (owner/repo)</label>
+              <input id="gh-full" name="full_name" class="form-control" placeholder="owner/repo">
+            </div>
+            <div class="mb-3">
+              <label class="form-label">API Base URL (optional)</label>
+              <input id="gh-api" name="api_base" class="form-control" placeholder="https://api.github.company.com">
+              <div class="form-text">Leave empty for public GitHub.</div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">Access Token</label>
+              <input id="gh-token" name="token" type="password" class="form-control">
+              <div class="form-text">
+                Use a fine‑grained PAT with <code>Contents: Read</code>. Create at
+                <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">GitHub → Tokens</a>.
+              </div>
+            </div>
+            <div class="d-flex gap-2">
+              <button id="btn-gh-test" type="button" class="btn btn-outline-secondary">Test</button>
+              <button id="btn-gh-save" class="btn btn-primary" disabled>Save</button>
+              <span id="gh-test-status" class="align-self-center ms-2"></span>
+            </div>
+          </form>
+        </div>
+        <div class="col-md-6">
+          <h5>Saved Repositories</h5>
+          {% if servers %}
+            <form id="gh-list-form">
+              <ul class="list-group">
+              {% for s in servers %}
+                <li class="list-group-item d-flex align-items-start" data-server-id="{{ s.id }}">
+                  <div class="form-check me-3">
+                    <input class="form-check-input select-server" type="radio" name="selected_server" id="gh-{{ loop.index0 }}" value="{{ s.id }}">
+                  </div>
+                  <div>
+                    <div class="fw-bold">{{ s.name }}</div>
+                    <div class="small text-muted">{{ s.full_name }}</div>
+                    {% if s.last_checked %}
+                      <div class="small text-muted">Last checked: {{ s.last_checked }}</div>
+                    {% endif %}
+                  </div>
+                </li>
+              {% endfor %}
+              </ul>
+            </form>
+            <div class="mt-3 mb-2 text-end">
+              <!-- Edit not implemented yet for GitHub -->
+              <button id="btn-remove" class="btn btn-outline-danger" disabled>Remove</button>
+            </div>
+            <form id="delete-form" method="post" style="display:none"></form>
+          {% else %}
+            <div class="text-muted">No repositories configured yet.</div>
+          {% endif %}
+        </div>
+      </div>
     {% else %}
       <h3 class="mb-3">{{ src|capitalize }} (Not configured yet)</h3>
-      <p class="text-muted">Support for {{ src }} will be added shortly. For now, switch to "Lightrun Servers" to manage Lightrun configs.</p>
+      <p class="text-muted">Support for {{ src }} will be added shortly.</p>
     {% endif %}
   </div>
 </div>
@@ -123,7 +193,7 @@ document.addEventListener('DOMContentLoaded', function(){
   document.getElementById('btn-edit')?.addEventListener('click', editSelected);
   document.getElementById('btn-remove')?.addEventListener('click', removeSelected);
 
-  // add-form behavior: require successful test before enabling Save
+  // Lightrun add-form behavior: require successful test before enabling Save
   const addForm = document.getElementById('add-server-form');
   if(addForm){
     addForm.addEventListener('submit', function(ev){
@@ -165,6 +235,39 @@ document.addEventListener('DOMContentLoaded', function(){
       }catch(e){
         statusEl.innerHTML = `<span class="badge bg-danger">Error</span> <small class="text-danger ms-1">${e}</small>`;
         document.getElementById('btn-add-save').disabled = true;
+      }
+    });
+  }
+  // GitHub add-form behavior
+  const ghForm = document.getElementById('add-gh-form');
+  if(ghForm){
+    ghForm.addEventListener('submit', function(ev){
+      const saveBtn = document.getElementById('btn-gh-save');
+      if(saveBtn.disabled){ ev.preventDefault(); alert('Please run Test and ensure it passes before saving.'); }
+    });
+    document.getElementById('btn-gh-test')?.addEventListener('click', async function(){
+      const name = document.getElementById('gh-name').value.trim();
+      const full = document.getElementById('gh-full').value.trim();
+      const token = document.getElementById('gh-token').value;
+      const api = document.getElementById('gh-api').value.trim();
+      const statusEl = document.getElementById('gh-test-status');
+      statusEl.innerHTML='';
+      if(!name){ alert('Name is required'); return; }
+      if(!/^\S+\/\S+$/.test(full)){ alert("Repository must be 'owner/repo'"); return; }
+      try{
+        const fd = new FormData(); fd.append('full_name', full); fd.append('token', token); if(api) fd.append('api_base', api);
+        const res = await fetch(`/setup/test-params/github`, {method:'POST', body: fd});
+        const j = await res.json();
+        if(j.ok){
+          statusEl.innerHTML = `<span class="badge bg-success">OK</span>`;
+          document.getElementById('btn-gh-save').disabled = false;
+        } else {
+          statusEl.innerHTML = `<span class="badge bg-danger">Fail</span> <small class="text-danger ms-1">${j.info || j.status || j.error || ''}</small>`;
+          document.getElementById('btn-gh-save').disabled = true;
+        }
+      }catch(e){
+        statusEl.innerHTML = `<span class="badge bg-danger">Error</span> <small class="text-danger ms-1">${e}</small>`;
+        document.getElementById('btn-gh-save').disabled = true;
       }
     });
   }

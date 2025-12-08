@@ -91,6 +91,13 @@ Security and privacy notes
 - All configuration data stays on the volume you mount at `/data`.
 - Diagnostic bundles are stored locally and are not transmitted automatically. Download and share them manually if needed.
 
+GitHub token permissions
+------------------------
+- Prefer a fine‑grained personal access token scoped to only the specific repositories you configure.
+- Repository permissions: `Contents: Read`.
+- No diff content is fetched — only commit author, date, and filenames changed.
+- For GitHub Enterprise, set the API base URL in Setup (e.g., `https://api.github.company.com`).
+
 Development only
 ----------------
 Local development helpers are provided via `run.sh`.
