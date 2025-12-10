@@ -1,21 +1,155 @@
 {% extends 'base.html' %}
 {% block content %}
-<h3>Display Summaries</h3>
-{% for s in summaries %}
-  <div class="card mb-3">
-    <div class="card-body">
-      <h5 class="card-title">{{ s.server }}</h5>
-      <p class="card-text">Latest: {{ s.latest }} | Size: {{ s.size if s.size is defined else 'n/a' }}</p>
-      {% if s.top_keys %}
-        <p><strong>Top keys:</strong> {{ s.top_keys|join(', ') }}</p>
-      {% endif %}
-      {% if s.items %}
-        <p><strong>Items:</strong> {{ s.items }}</p>
-      {% endif %}
-      {% if s.preview %}
-        <pre class="small">{{ s.preview }}</pre>
-      {% endif %}
+  <style>
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; }
+    .chart { position: relative; height: 360px; margin-bottom: 16px; }
+    .grid-layer { position: absolute; inset: 0; pointer-events: none; }
+    .grid-line { position: absolute; left: 40px; right: 0; height: 1px; background: #e5e7eb; }
+    .grid-label { position: absolute; left: 0; width: 36px; font-size: 11px; color: #666; text-align: right; transform: translateY(-50%); }
+    .weeks { display: grid; grid-template-columns: repeat(13, 1fr); gap: 6px; align-items: end; height: 336px; margin-left: 40px; }
+    .bar { background: #4a90e2; border-radius: 4px; cursor: pointer; width: 14px; }
+    .bar:hover { background: #357ABD; }
+    .label { font-size: 11px; text-align: center; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; }
+    th { background: #f7f7f7; }
+  </style>
+  <h2>Usage Overview (Last 13 Weeks)</h2>
+  <form method="get" action="/display" style="margin-bottom: 12px;">
+    <label for="server" style="margin-right:8px">Server:</label>
+    <select id="server" name="server" onchange="this.form.submit()">
+      <option value="" {{ 'all' == selected_server and 'selected' or '' }}>All servers</option>
+      {% for sid, sname in servers.items() %}
+        <option value="{{ sid }}" {% if selected_server == sid %}selected{% endif %}>{{ sname }}</option>
+      {% endfor %}
+    </select>
+  </form>
+  <div class="grid">
+    <div class="card">
+      <h3>Weekly Timeline</h3>
+      <div class="chart">
+        <div id="grid-layer" class="grid-layer"></div>
+        <div id="weeks" class="weeks"></div>
+      </div>
+      <div id="week-details" class="card" style="margin-top: 16px; display:none">
+        <h4 id="week-title">Week</h4>
+        <div class="grid">
+          <div>
+            <h5>Top Users</h5>
+            <table>
+              <thead><tr><th>User</th><th>Total</th></tr></thead>
+              <tbody id="week-users"></tbody>
+            </table>
+          </div>
+          <div>
+            <h5>Action Types</h5>
+            <table>
+              <thead><tr><th>Action</th><th>Total</th></tr></thead>
+              <tbody id="week-actions"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Top Users (13 Weeks)</h3>
+      <table>
+        <thead><tr><th>User</th><th>Total</th></tr></thead>
+        <tbody id="top-users"></tbody>
+      </table>
     </div>
   </div>
-{% endfor %}
+
+    <script type="application/json" id="timeline-data">{{ timeline | tojson }}</script>
+    <script type="application/json" id="top-users-data">{{ top_users | tojson }}</script>
+    <script>
+        const timeline = JSON.parse(document.getElementById('timeline-data').textContent);
+        const topUsers = JSON.parse(document.getElementById('top-users-data').textContent);
+        console.log('timeline data:', timeline);
+        console.log('top users:', topUsers);
+      // Oldest to newest left-to-right
+      timeline.sort((a, b) => (a.week > b.week ? 1 : -1));
+      const maxTotal = Math.max(1, ...timeline.map(t => t.total || 0));
+      const CH = 360; // chart height in px
+      const PAD_BOTTOM = 24; // inner padding for labels/spacing
+      const CHI = CH - PAD_BOTTOM; // inner drawable height
+      const weeksEl = document.getElementById('weeks');
+      const gridLayer = document.getElementById('grid-layer');
+      // Build grid lines at ~1/5 of total height with step divisible by 10 when possible
+      const rawStep = Math.ceil(maxTotal / 5);
+      let step = rawStep < 10 ? rawStep : Math.max(10, Math.round(rawStep / 10) * 10);
+      if (!Number.isFinite(step) || step <= 0) step = 1;
+      for (let v = step; v <= maxTotal; v += step) {
+        const y = Math.round(PAD_BOTTOM + (CHI - (v / maxTotal) * CHI));
+        const line = document.createElement('div');
+        line.className = 'grid-line';
+        line.style.top = `${y}px`;
+        const lab = document.createElement('div');
+        lab.className = 'grid-label';
+        lab.style.top = `${y}px`;
+        lab.textContent = String(v);
+        gridLayer.appendChild(line);
+        gridLayer.appendChild(lab);
+      }
+      timeline.forEach(item => {
+        let h = Math.round(((item.total || 0) / maxTotal) * CHI);
+        if (h === 0 && (item.total || 0) > 0) h = 2; // ensure visibility
+        const wrap = document.createElement('div');
+        wrap.style.display = 'flex';
+        wrap.style.flexDirection = 'column';
+        wrap.style.alignItems = 'center';
+        const bar = document.createElement('div');
+        bar.className = 'bar';
+        bar.style.height = `${h}px`;
+        bar.title = `${item.week}: ${item.total}`;
+        bar.onclick = () => loadWeek(item.week);
+        const label = document.createElement('div');
+        label.className = 'label';
+        label.textContent = item.week.slice(5); // MM-DD
+        wrap.appendChild(bar);
+        wrap.appendChild(label);
+        weeksEl.appendChild(wrap);
+      });
+
+      // Render overall top users
+      const tuEl = document.getElementById('top-users');
+      (topUsers || []).slice(0, 25).forEach(u => {
+        const tr = document.createElement('tr');
+        const tdU = document.createElement('td'); tdU.textContent = u.user;
+        const tdT = document.createElement('td'); tdT.textContent = u.total;
+        tr.appendChild(tdU); tr.appendChild(tdT);
+        tuEl.appendChild(tr);
+      });
+
+      async function loadWeek(week) {
+        try {
+          const res = await fetch(`/display/week/${week}`);
+          const data = await res.json();
+          document.getElementById('week-details').style.display = 'block';
+          document.getElementById('week-title').textContent = `Week ${week}`;
+          const wu = document.getElementById('week-users');
+          wu.innerHTML = '';
+          (data.users || []).slice(0, 50).forEach(u => {
+            const tr = document.createElement('tr');
+            const tdU = document.createElement('td'); tdU.textContent = u.user;
+            const tdT = document.createElement('td'); tdT.textContent = u.total;
+            tr.appendChild(tdU); tr.appendChild(tdT);
+            wu.appendChild(tr);
+          });
+          const wa = document.getElementById('week-actions');
+          wa.innerHTML = '';
+          const actions = data.actions || {};
+          Object.keys(actions).sort((a,b)=>actions[b]-actions[a]).forEach(k => {
+            const tr = document.createElement('tr');
+            const tdK = document.createElement('td'); tdK.textContent = k;
+            const tdV = document.createElement('td'); tdV.textContent = actions[k];
+            tr.appendChild(tdK); tr.appendChild(tdV);
+            wa.appendChild(tr);
+          });
+        } catch (e) {
+          console.error('Failed to load week', e);
+        }
+      }
+  </script>
 {% endblock %}

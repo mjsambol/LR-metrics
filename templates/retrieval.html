@@ -26,26 +26,28 @@
         form.addEventListener('submit', function(){
           if (btn) { btn.style.visibility = 'hidden'; btn.disabled = true; }
           if (loading) loading.style.display = 'block';
-          // poll server progress
+          // poll unified server progress once per second
           timer = setInterval(async function(){
-            let total = window.TOTAL_OVERALL || 0;
+            const total = window.TOTAL_OVERALL || 0;
             let completedSum = 0;
             let currentName = '';
+            let phaseLabel = '';
             try {
-              const res = await fetch('/progress/lightrun');
-              const j = await res.json();
-              completedSum += (j.completed || []).length;
-              if (!currentName && j.current) currentName = j.current;
-            } catch (e) {}
-            try {
-              const res2 = await fetch('/progress/github');
-              const j2 = await res2.json();
-              completedSum += (j2.completed || []).length;
-              if (!currentName && j2.current) currentName = j2.current;
+              const res = await fetch('/progress');
+              const all = await res.json();
+              const lr = all.lightrun || {};
+              const gh = all.github || {};
+              completedSum += ((lr.completed || []).length + (gh.completed || []).length);
+              if (!currentName && lr.current) { currentName = lr.current; phaseLabel = 'Lightrun'; }
+              if (!currentName && gh.current) { currentName = gh.current; phaseLabel = 'GitHub'; }
             } catch (e) {}
             let text = `Completed: ${completedSum}/${total}`;
             if (currentName) {
-              text = `${text} · Now fetching: ${currentName}`;
+              if (phaseLabel) {
+                text = `${text} · Now fetching: ${phaseLabel} · ${currentName}`;
+              } else {
+                text = `${text} · Now fetching: ${currentName}`;
+              }
             }
             if (progressText) progressText.textContent = text;
           }, 1000);

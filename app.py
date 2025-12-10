@@ -144,6 +144,309 @@ from github_api import (
     store_report as gh_store_report,
     get_latest_report_generated_at as gh_latest_generated_at,
 )
+# Usage summary paths
+SUMMARIES_DIR = os.path.join(DATA_DIR, 'summaries')
+USAGE_SUMMARY_PATH = os.path.join(SUMMARIES_DIR, 'usage_summary.json')
+os.makedirs(SUMMARIES_DIR, exist_ok=True)
+SUMMARY_VERSION = 3
+
+def _week_start(date_str: str) -> str:
+    # Convert YYYY-MM-DD to Monday of that week, return as YYYY-MM-DD
+    try:
+        from datetime import datetime, timedelta
+        d = datetime.strptime(date_str, '%Y-%m-%d')
+        monday = d - timedelta(days=d.weekday())
+        return monday.strftime('%Y-%m-%d')
+    except Exception:
+        return date_str
+
+def build_usage_summary() -> dict:
+    # Scan diagnostics bundles for USAGE_INFO.json and aggregate daily/weekly
+    root = os.path.join(DATA_DIR, 'diagnostics_bundles')
+    daily = {}
+    daily_by_server = {}
+    bundles_mtime_max = 0
+    import zipfile
+    from datetime import datetime
+    for sid in os.listdir(root) if os.path.exists(root) else []:
+        sdir = os.path.join(root, sid)
+        if not os.path.isdir(sdir):
+            continue
+        if sid not in daily_by_server:
+            daily_by_server[sid] = {}
+        for f in os.listdir(sdir):
+            if not f.endswith('.zip'):
+                continue
+            path = os.path.join(sdir, f)
+            try:
+                m = os.path.getmtime(path)
+                if m > bundles_mtime_max:
+                    bundles_mtime_max = m
+                with zipfile.ZipFile(path, 'r') as z:
+                    # robustly find USAGE_INFO.json anywhere within zip
+                    target = next((name for name in z.namelist() if name.endswith('USAGE_INFO.json')), None)
+                    if not target:
+                        continue
+                    with z.open(target) as zh:
+                        content = zh.read().decode('utf-8', errors='ignore')
+                    try:
+                        j = json.loads(content)
+                    except Exception:
+                        continue
+                    da = (((j or {}).get('data') or {}).get('dailyActivity') or {})
+                    if not isinstance(da, dict):
+                        continue
+                    for dstr, obj in da.items():
+                        actions = (obj.get('actionActivity') or {})
+                        total = 0
+                        if isinstance(actions, dict):
+                            for k, v in actions.items():
+                                try:
+                                    total += int(v)
+                                except Exception:
+                                    pass
+                        # attribute users from userLogin, but don't count userLogin itself as an action
+                        users = []
+                        ul = (((obj.get('userLogin') or {}).get('users')) or [])
+                        if isinstance(ul, list):
+                            users = [u for u in ul if isinstance(u, str)]
+                        # overall daily
+                        entry = daily.get(dstr) or {'total': 0, 'users': set(), 'actionCounts': {}}
+                        entry['total'] += total
+                        entry['users'].update(users)
+                        if isinstance(actions, dict):
+                            ac = entry['actionCounts']
+                            for k, v in actions.items():
+                                try:
+                                    ac[k] = ac.get(k, 0) + int(v)
+                                except Exception:
+                                    pass
+                        daily[dstr] = entry
+                        # per-server daily
+                        sentry = daily_by_server[sid].get(dstr) or {'total': 0, 'users': set(), 'actionCounts': {}}
+                        sentry['total'] += total
+                        sentry['users'].update(users)
+                        if isinstance(actions, dict):
+                            sac = sentry['actionCounts']
+                            for k, v in actions.items():
+                                try:
+                                    sac[k] = sac.get(k, 0) + int(v)
+                                except Exception:
+                                    pass
+                        daily_by_server[sid][dstr] = sentry
+            except Exception:
+                continue
+    # convert sets to lists
+    for dstr, entry in daily.items():
+        entry['users'] = sorted(list(entry['users']))
+    for sid, dmap in daily_by_server.items():
+        for dstr, entry in dmap.items():
+            entry['users'] = sorted(list(entry['users']))
+    # weekly aggregation
+    weeks = {}
+    weeks_by_server = {}
+    for dstr, entry in daily.items():
+        w = _week_start(dstr)
+        wentry = weeks.get(w) or {'total': 0, 'usersCounts': {}, 'actionCounts': {}}
+        wentry['total'] += entry['total']
+        users = entry.get('users', [])
+        if len(users) == 1 and entry['total'] > 0:
+            u = users[0]
+            wentry['usersCounts'][u] = wentry['usersCounts'].get(u, 0) + entry['total']
+        for k, v in (entry['actionCounts'] or {}).items():
+            wentry['actionCounts'][k] = wentry['actionCounts'].get(k, 0) + v
+        weeks[w] = wentry
+    for sid, dmap in daily_by_server.items():
+        smap = weeks_by_server.get(sid) or {}
+        for dstr, entry in dmap.items():
+            w = _week_start(dstr)
+            wentry = smap.get(w) or {'total': 0, 'usersCounts': {}, 'actionCounts': {}}
+            wentry['total'] += entry['total']
+            users = entry.get('users', [])
+            if len(users) == 1 and entry['total'] > 0:
+                u = users[0]
+                wentry['usersCounts'][u] = wentry['usersCounts'].get(u, 0) + entry['total']
+            for k, v in (entry['actionCounts'] or {}).items():
+                wentry['actionCounts'][k] = wentry['actionCounts'].get(k, 0) + v
+            smap[w] = wentry
+        weeks_by_server[sid] = smap
+    summary = {
+        'generated_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'daily': daily,
+        'daily_by_server': daily_by_server,
+        'weeks': weeks,
+        'weeks_by_server': weeks_by_server,
+        'bundles_mtime_max': bundles_mtime_max,
+        'version': SUMMARY_VERSION,
+    }
+    try:
+        with open(USAGE_SUMMARY_PATH, 'w') as f:
+            json.dump(summary, f, indent=2)
+    except Exception:
+        pass
+    return summary
+
+# Audits fetching and attribution summary
+AUDITS_DIR = os.path.join(DATA_DIR, 'audits')
+os.makedirs(AUDITS_DIR, exist_ok=True)
+
+def fetch_audits_for_server(server: dict, from_date: str, to_date: str, auth_cookie: dict, progress_cb=None) -> dict:
+    s = requests.Session()
+    s.verify = False
+    # Get company id
+    company_id = None
+    try:
+        resp = s.get(f"{server['url'].rstrip('/')}/api/account?withAccess=false", cookies=auth_cookie, verify=False)
+        print(f"[LRmetrics][audits] /api/account status={resp.status_code}")
+        company_id = (resp.json() or {}).get('companyName')
+    except Exception as e:
+        print(f"[LRmetrics][audits] Failed to fetch account: {e}")
+        company_id = None
+    if not company_id:
+        return {'entries': [], 'fromDate': from_date, 'toDate': to_date}
+    PAGE_SIZE = 1000
+    page = 0
+    entries = []
+    while True:
+        params = {"fromDate": from_date, "toDate": to_date, "size": PAGE_SIZE, "page": page}
+        url = f"{server['url'].rstrip('/')}/management/company/{company_id}/audits"
+        resp = s.get(url, params=params, cookies=auth_cookie, verify=False)
+        print(f"[LRmetrics][audits] GET {url} page={page} status={resp.status_code}")
+        try:
+            audits = resp.json()
+        except Exception:
+            audits = []
+        batch = 0
+        for audit in audits:
+            t = audit.get('type') or ''
+            principal = audit.get('principal') or ''
+            data = audit.get('data') or {}
+            create_time = data.get('create_time') or audit.get('timestamp')
+            file_name = data.get('file_name') or data.get('source')
+            action = t.split(' ', 1)[0] if ' ' in t else t
+            if action and principal:
+                entries.append({
+                    'principal': principal,
+                    'action': action,
+                    'file_name': file_name,
+                    'create_time': create_time,
+                })
+                batch += 1
+        if progress_cb:
+            try:
+                _write_progress('lightrun', current=f"{server.get('name') or server.get('id')} · page {page}", completed=[], total=PAGE_SIZE)
+            except Exception:
+                pass
+        print(f"[LRmetrics][audits] Collected {batch} entries on page {page} (total so far {len(entries)}).")
+        if not audits or len(audits) < PAGE_SIZE:
+            break
+        page += 1
+    return {'entries': entries, 'fromDate': from_date, 'toDate': to_date}
+
+def store_audits(server: dict, content: dict):
+    sid = server.get('id') or server.get('name')
+    ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    sdir = os.path.join(AUDITS_DIR, sid)
+    os.makedirs(sdir, exist_ok=True)
+    with open(os.path.join(sdir, f"{ts}.json"), 'w') as f:
+        json.dump(content, f)
+
+def build_audits_summary() -> dict:
+    # Aggregate audits into weekly per-user totals and action type breakdown
+    root = AUDITS_DIR
+    weeks = {}
+    weeks_by_server = {}
+    allowed_actions = {"SNAPSHOT", "LOG", "COUNTER", "TICTOC"}
+    ignored_users = {"system", "Agent", "Api Key"}
+    for sid in os.listdir(root) if os.path.exists(root) else []:
+        sdir = os.path.join(root, sid)
+        if not os.path.isdir(sdir):
+            continue
+        smap = weeks_by_server.get(sid) or {}
+        for f in os.listdir(sdir):
+            if not f.endswith('.json'):
+                continue
+            path = os.path.join(sdir, f)
+            try:
+                with open(path, 'r') as fh:
+                    payload = json.load(fh)
+                entries = payload.get('entries') or []
+            except Exception:
+                entries = []
+            for e in entries:
+                ct = e.get('create_time') or ''
+                try:
+                    dstr = (ct[:10])
+                except Exception:
+                    continue
+                # Filter by action type and user
+                a = e.get('action') or ''
+                if a not in allowed_actions:
+                    continue
+                u = e.get('principal') or ''
+                if u in ignored_users:
+                    continue
+                w = _week_start(dstr)
+                wentry = weeks.get(w) or {'total': 0, 'usersCounts': {}, 'actionCounts': {}}
+                smentry = smap.get(w) or {'total': 0, 'usersCounts': {}, 'actionCounts': {}}
+                wentry['total'] += 1
+                smentry['total'] += 1
+                if u:
+                    wentry['usersCounts'][u] = wentry['usersCounts'].get(u, 0) + 1
+                    smentry['usersCounts'][u] = smentry['usersCounts'].get(u, 0) + 1
+                if a:
+                    wentry['actionCounts'][a] = wentry['actionCounts'].get(a, 0) + 1
+                    smentry['actionCounts'][a] = smentry['actionCounts'].get(a, 0) + 1
+                weeks[w] = wentry
+                smap[w] = smentry
+        weeks_by_server[sid] = smap
+    summary = {
+        'generated_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'weeks': weeks,
+        'weeks_by_server': weeks_by_server,
+    }
+    # Store audits summary alongside usage summary
+    try:
+        with open(os.path.join(SUMMARIES_DIR, 'audits_summary.json'), 'w') as f:
+            json.dump(summary, f, indent=2)
+    except Exception:
+        pass
+    return summary
+
+def ensure_usage_summary_fresh():
+    # Rebuild summary if missing or older than newest bundle
+    latest_bundle_mtime = 0
+    root = os.path.join(DATA_DIR, 'diagnostics_bundles')
+    for sid in os.listdir(root) if os.path.exists(root) else []:
+        sdir = os.path.join(root, sid)
+        if not os.path.isdir(sdir):
+            continue
+        for f in os.listdir(sdir):
+            if f.endswith('.zip'):
+                try:
+                    m = os.path.getmtime(os.path.join(sdir, f))
+                    if m > latest_bundle_mtime:
+                        latest_bundle_mtime = m
+                except Exception:
+                    continue
+    current_mtime = -1
+    try:
+        if os.path.exists(USAGE_SUMMARY_PATH):
+            current_mtime = os.path.getmtime(USAGE_SUMMARY_PATH)
+    except Exception:
+        current_mtime = -1
+    needs_rebuild = current_mtime < latest_bundle_mtime
+    # also rebuild if version mismatch
+    try:
+        if os.path.exists(USAGE_SUMMARY_PATH):
+            with open(USAGE_SUMMARY_PATH, 'r') as f:
+                cur = json.load(f)
+            if (cur or {}).get('version') != SUMMARY_VERSION:
+                needs_rebuild = True
+    except Exception:
+        needs_rebuild = True
+    if needs_rebuild:
+        build_usage_summary()
 
 
 def store_retrieved(server, content, ts=None):
@@ -196,18 +499,26 @@ def get_last_retrieved_timestamp():
     return datetime.fromtimestamp(latest_ts).strftime('%Y-%m-%d %H:%M:%S')
 
 def _write_progress(source: str, current: str = '', completed=None, total: int = 0):
+    # Merge per-source progress into a single JSON object
     try:
         if completed is None:
             completed = []
-        state = {
-            'source': source,
+        entry = {
             'current': current,
             'completed': completed,
             'total': total,
             'ts': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
         }
+        combined = {}
+        try:
+            if os.path.exists(PROGRESS_PATH):
+                with open(PROGRESS_PATH, 'r') as f:
+                    combined = json.load(f) or {}
+        except Exception:
+            combined = {}
+        combined[source] = entry
         with open(PROGRESS_PATH, 'w') as f:
-            json.dump(state, f)
+            json.dump(combined, f)
     except Exception:
         pass
 
@@ -218,18 +529,30 @@ def _clear_progress():
     except Exception:
         pass
 
-@app.route('/progress/<source>')
-def progress(source):
+@app.route('/progress')
+def progress_all():
+    # Return combined progress for all sources
     try:
         if not os.path.exists(PROGRESS_PATH):
-            return jsonify({'source': source, 'current': '', 'completed': [], 'total': 0}), 200
+            return jsonify({}), 200
         with open(PROGRESS_PATH, 'r') as f:
             state = json.load(f)
-        if state.get('source') != source:
-            return jsonify({'source': source, 'current': '', 'completed': [], 'total': 0}), 200
-        return jsonify(state)
+        return jsonify(state), 200
     except Exception:
-        return jsonify({'source': source, 'current': '', 'completed': [], 'total': 0}), 200
+        return jsonify({}), 200
+
+@app.route('/progress/<source>')
+def progress(source):
+    # Back-compat endpoint: return only the requested source's progress
+    try:
+        if not os.path.exists(PROGRESS_PATH):
+            return jsonify({'current': '', 'completed': [], 'total': 0}), 200
+        with open(PROGRESS_PATH, 'r') as f:
+            combined = json.load(f) or {}
+        entry = combined.get(source) or {'current': '', 'completed': [], 'total': 0}
+        return jsonify(entry), 200
+    except Exception:
+        return jsonify({'current': '', 'completed': [], 'total': 0}), 200
 
 
 @app.route('/')
@@ -562,12 +885,31 @@ def retrieve():
                     # status failure or timeout
                     failures += 1
                     results.append({'server': s.get('id'), 'diagnostics': 'started', 'status': status_info})
+                # Fetch audits for the last 13 weeks window
+                try:
+                    from datetime import timedelta
+                    # Anchor window to current Monday (start of week)
+                    today = datetime.utcnow().date()
+                    monday = today - timedelta(days=today.weekday())
+                    to_date = monday.strftime('%Y-%m-%d')
+                    from_date = (monday - timedelta(weeks=13)).strftime('%Y-%m-%d')
+                    # Progress will show "Server · page N" as pages advance
+                    audits_payload = fetch_audits_for_server(s, from_date, to_date, auth_cookie, progress_cb=True)
+                    if isinstance(audits_payload, dict):
+                        store_audits(s, audits_payload)
+                except Exception as ae:
+                    results.append({'server': s.get('id'), 'audits_error': str(ae)})
             except Exception as e:
                 results.append({'server': s.get('id'), 'error': str(e)})
                 failures += 1
             # mark completion of this server
             completed_ids.append(s.get('name') or s.get('id'))
             _write_progress('lightrun', current='', completed=completed_ids, total=total_overall)
+        # After audits fetched for all servers, rebuild audits summary
+        try:
+            build_audits_summary()
+        except Exception:
+            pass
         # Process GitHub repos as part of unified retrieval
         completed_repos = []
         _write_progress('github', current='', completed=[], total=total_overall)
@@ -660,34 +1002,94 @@ def retrieve():
 
 @app.route('/display')
 def display():
-    servers = get_servers_for('lightrun')
-    summaries = []
-    for s in servers:
-        sid = s['id']
-        sdir = os.path.join(DATA_DIR, sid)
-        latest = None
-        if os.path.exists(sdir):
-            files = sorted(os.listdir(sdir), reverse=True)
-            if files:
-                latest = files[0]
-                with open(os.path.join(sdir, latest), 'r') as f:
-                    content = f.read()
-                # try to parse JSON to get simple counts
-                summary = {'server': sid, 'latest': latest, 'size': os.path.getsize(os.path.join(sdir, latest))}
-                try:
-                    j = json.loads(content)
-                    if isinstance(j, dict):
-                        summary['top_keys'] = list(j.keys())[:6]
-                    elif isinstance(j, list):
-                        summary['items'] = len(j)
-                except Exception:
-                    summary['preview'] = content[:400]
-            else:
-                summary = {'server': sid, 'latest': None}
-        else:
-            summary = {'server': sid, 'latest': None}
-        summaries.append(summary)
-    return render_template('display.html', summaries=summaries)
+    ensure_usage_summary_fresh()
+    summary = {}
+    try:
+        with open(USAGE_SUMMARY_PATH, 'r') as f:
+            summary = json.load(f)
+    except Exception:
+        summary = {'daily': {}, 'weeks': {}}
+    # Prepare last 13 weeks timeline
+    from datetime import datetime, timedelta
+    # Apply server filter to weeks before building the timeline
+    server_id = request.args.get('server')
+    weeks = summary.get('weeks') or {}
+    if server_id and server_id != 'all':
+        weeks = (summary.get('weeks_by_server') or {}).get(server_id) or {}
+    week_keys = sorted(weeks.keys())
+    # Build timeline primarily from audits totals to match week details; fallback to usage when audits missing
+    audits_summary = {}
+    try:
+        with open(os.path.join(SUMMARIES_DIR, 'audits_summary.json'), 'r') as f:
+            audits_summary = json.load(f)
+    except Exception:
+        audits_summary = {'weeks': {}}
+    audits_weeks = (audits_summary.get('weeks') or {})
+    if server_id and server_id != 'all':
+        audits_weeks = (audits_summary.get('weeks_by_server') or {}).get(server_id) or {}
+    constructed = []
+    today = datetime.utcnow()
+    anchor = today - timedelta(days=today.weekday())
+    anchors = [(anchor - timedelta(weeks=i)).strftime('%Y-%m-%d') for i in range(13)]
+    any_data = False
+    for k in anchors:
+        a_total = (audits_weeks.get(k) or {}).get('total', 0)
+        total = a_total
+        if total:
+            any_data = True
+        constructed.append({'week': k, 'total': total})
+    if not any_data:
+        # fallback to usage totals if audits provide no data
+        constructed = []
+        for k in anchors:
+            u_total = (weeks.get(k) or {}).get('total', 0)
+            constructed.append({'week': k, 'total': u_total})
+        if not any(w.get('total', 0) for w in constructed):
+            # fallback to last available usage weeks
+            constructed = []
+            for k in week_keys[-13:]:
+                constructed.append({'week': k, 'total': (weeks.get(k) or {}).get('total', 0)})
+    last_weeks = constructed
+    # server_id already applied to weeks above
+    # Top users over last 13 weeks (use audits summary attribution)
+    # Use audits weeks (filtered as above) for top users aggregation
+    user_counts = {}
+    for item in last_weeks:
+        wk = item['week']
+        wentry = audits_weeks.get(wk) or {}
+        for u, cnt in (wentry.get('usersCounts') or {}).items():
+            user_counts[u] = user_counts.get(u, 0) + cnt
+    top_users = sorted(([{'user': u, 'total': c} for u, c in user_counts.items() if c > 0]), key=lambda x: x['total'], reverse=True)
+    # Logging for troubleshooting timeline data
+    try:
+        app.logger.info('Display timeline weeks count=%d', len(last_weeks))
+        app.logger.info('Display weeks keys present=%s', ','.join(sorted(list(weeks.keys()))[-13:]))
+        app.logger.info('Display timeline sample=%s', last_weeks[:5])
+        app.logger.info('Display top_users sample=%s', top_users[:5])
+    except Exception:
+        pass
+    # Build server id->name mapping for selector
+    lr_servers = get_servers_for('lightrun')
+    server_labels = {s.get('id'): (s.get('name') or s.get('id')) for s in lr_servers}
+    return render_template('display.html', timeline=last_weeks, top_users=top_users, servers=server_labels, selected_server=server_id or 'all')
+
+@app.route('/display/week/<week_start>')
+def display_week(week_start):
+    # Use audits summary for detailed per-week users and actions
+    try:
+        with open(os.path.join(SUMMARIES_DIR, 'audits_summary.json'), 'r') as f:
+            audits_summary = json.load(f)
+    except Exception:
+        return jsonify({'error': 'summary not available'}), 404
+    server_id = request.args.get('server')
+    audits_weeks = audits_summary.get('weeks') or {}
+    if server_id:
+        audits_weeks = (audits_summary.get('weeks_by_server') or {}).get(server_id) or {}
+    w = audits_weeks.get(week_start)
+    if not w:
+        return jsonify({'week': week_start, 'users': [], 'actions': {}})
+    users_sorted = sorted(([{'user': u, 'total': t} for u, t in (w.get('usersCounts') or {}).items() if t > 0]), key=lambda x: x['total'], reverse=True)
+    return jsonify({'week': week_start, 'users': users_sorted, 'actions': w.get('actionCounts') or {}})
 
 
 @app.route('/export')
