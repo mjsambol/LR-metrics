@@ -144,6 +144,134 @@ from github_api import (
     store_report as gh_store_report,
     get_latest_report_generated_at as gh_latest_generated_at,
 )
+# Git CLI uploads
+GIT_CLI_DIR = os.path.join(DATA_DIR, 'git_cli')
+os.makedirs(GIT_CLI_DIR, exist_ok=True)
+
+def store_git_cli_upload(repo_id: str, content: dict):
+    rid = repo_id or 'manual'
+    ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    rdir = os.path.join(GIT_CLI_DIR, rid)
+    os.makedirs(rdir, exist_ok=True)
+    with open(os.path.join(rdir, f"{ts}.json"), 'w') as f:
+        json.dump(content, f)
+
+def iter_all_git_changes() -> list:
+    # Collect changes from API reports and CLI uploads
+    changes = []
+    # API reports
+    gh_root = os.path.join(DATA_DIR, 'github_reports')
+    if os.path.exists(gh_root):
+        for rid in os.listdir(gh_root):
+            rdir = os.path.join(gh_root, rid)
+            for f in os.listdir(rdir) if os.path.isdir(rdir) else []:
+                if not f.endswith('.json'):
+                    continue
+                try:
+                    with open(os.path.join(rdir, f), 'r') as fh:
+                        rep = json.load(fh)
+                    for c in (rep.get('changes') or []):
+                        changes.append({'date': c.get('date'), 'files': c.get('files') or [], 'repo': rep.get('full_name'), 'source': 'api'})
+                except Exception:
+                    pass
+    # CLI uploads
+    if os.path.exists(GIT_CLI_DIR):
+        for rid in os.listdir(GIT_CLI_DIR):
+            rdir = os.path.join(GIT_CLI_DIR, rid)
+            for f in os.listdir(rdir) if os.path.isdir(rdir) else []:
+                if not f.endswith('.json'):
+                    continue
+                try:
+                    with open(os.path.join(rdir, f), 'r') as fh:
+                        rep = json.load(fh)
+                    for c in (rep.get('changes') or []):
+                        # Expect {commit, date, files[]}
+                        changes.append({'date': c.get('date'), 'files': c.get('files') or [], 'repo': rep.get('repo') or rid, 'source': 'cli'})
+                except Exception:
+                    pass
+    return changes
+
+def parse_git_txt(stream) -> dict:
+    # Parse plain text from `git log --name-only --date=iso --pretty="%H|%ad|%an"`
+    changes = []
+    current = None
+    for raw in stream.read().decode('utf-8', errors='ignore').splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if '|' in line:
+            parts = line.split('|')
+            if len(parts) >= 3:
+                commit, date, author = parts[0], parts[1], parts[2]
+                current = {'commit': commit, 'date': date, 'author': author, 'files': []}
+                changes.append(current)
+            continue
+        # file path line
+        if current is not None:
+            current['files'].append(line)
+    return {'changes': changes}
+
+def build_correlations(audits_weeks: dict) -> list:
+    # Build correlation entries: same-date same-file between audits and git changes
+    git_changes = iter_all_git_changes()
+    # index git by date->file set
+    git_index = {}
+    for ch in git_changes:
+        d = (ch.get('date') or '')[:10]
+        files = set([f for f in (ch.get('files') or []) if isinstance(f, str)])
+        if not d or not files:
+            continue
+        entry = git_index.get(d) or set()
+        entry.update(files)
+        git_index[d] = entry
+    correlations = []
+    for wk, wentry in (audits_weeks or {}).items():
+        # iterate usersCounts is not needed; we need raw entries per day, but we only stored weekly counts.
+        # Approximate: use actionCounts presence across week days by checking the audits entries again per stored files/dated entries in audits dir.
+        # Simpler: Re-scan audits entries to match by day.
+        try:
+            # Collect audit entries for week from raw audits store
+            week_start = wk
+            from datetime import datetime, timedelta
+            d0 = datetime.strptime(week_start, '%Y-%m-%d')
+            days = [(d0 + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
+        except Exception:
+            days = []
+        # Scan raw audits for all servers
+        for sid in os.listdir(AUDITS_DIR) if os.path.exists(AUDITS_DIR) else []:
+            sdir = os.path.join(AUDITS_DIR, sid)
+            if not os.path.isdir(sdir):
+                continue
+            for fname in os.listdir(sdir):
+                if not fname.endswith('.json'):
+                    continue
+                try:
+                    with open(os.path.join(sdir, fname), 'r') as fh:
+                        payload = json.load(fh)
+                    entries = payload.get('entries') or []
+                except Exception:
+                    entries = []
+                for e in entries:
+                    ct = (e.get('create_time') or '')[:10]
+                    if ct not in days:
+                        continue
+                    file_name = e.get('file_name') or ''
+                    if not file_name:
+                        continue
+                    # match file exact or basename
+                    files_on_day = git_index.get(ct) or set()
+                    if file_name in files_on_day or os.path.basename(file_name) in set([os.path.basename(f) for f in files_on_day]):
+                        correlations.append({
+                            'date': ct,
+                            'file': file_name,
+                            'user': e.get('principal'),
+                            'action': e.get('action'),
+                            'server': sid,
+                            'week': wk,
+                        })
+    # sort by date desc
+    correlations.sort(key=lambda x: x.get('date',''), reverse=True)
+    return correlations
 # Usage summary paths
 SUMMARIES_DIR = os.path.join(DATA_DIR, 'summaries')
 USAGE_SUMMARY_PATH = os.path.join(SUMMARIES_DIR, 'usage_summary.json')
@@ -813,6 +941,43 @@ def setup_delete(src, server_id):
     return redirect(url_for('setup', src=src))
 
 
+@app.route('/upload/git', methods=['POST'])
+def upload_git_cli():
+    # Accept a JSON file containing {repo: string, changes: [{commit, date, author, files: [..]}]}
+    try:
+        repo_id = request.form.get('repo_id') or 'manual'
+        if 'file' not in request.files:
+            flash('No file uploaded', 'warning')
+            return redirect(url_for('retrieve'))
+        f = request.files['file']
+        data = json.load(f.stream)
+        if not isinstance(data, dict):
+            flash('Invalid JSON format', 'danger')
+            return redirect(url_for('retrieve'))
+        store_git_cli_upload(repo_id, data)
+        flash('Git CLI data uploaded', 'success')
+    except Exception as e:
+        flash(f'Upload failed: {e}', 'danger')
+    return redirect(url_for('retrieve'))
+
+@app.route('/upload/git-txt', methods=['POST'])
+def upload_git_cli_txt():
+    # Accept a plain text output from git CLI and convert to JSON changes
+    try:
+        repo_id = request.form.get('repo_id') or 'manual'
+        if 'file' not in request.files:
+            flash('No file uploaded', 'warning')
+            return redirect(url_for('retrieve'))
+        f = request.files['file']
+        parsed = parse_git_txt(f.stream)
+        data = {'repo': repo_id, 'changes': parsed.get('changes') or []}
+        store_git_cli_upload(repo_id, data)
+        flash('Git CLI text uploaded and parsed', 'success')
+    except Exception as e:
+        flash(f'Upload failed: {e}', 'danger')
+    return redirect(url_for('retrieve'))
+
+
 @app.route('/retrieve', methods=['GET', 'POST'])
 def retrieve():
     servers = get_servers_for('lightrun')
@@ -1060,6 +1225,10 @@ def display():
         for u, cnt in (wentry.get('usersCounts') or {}).items():
             user_counts[u] = user_counts.get(u, 0) + cnt
     top_users = sorted(([{'user': u, 'total': c} for u, c in user_counts.items() if c > 0]), key=lambda x: x['total'], reverse=True)
+    # Build correlations for the currently selected server (or all)
+    corr_weeks = audits_weeks if (server_id and server_id != 'all') else (audits_summary.get('weeks') or {})
+    correlations = build_correlations(corr_weeks)
+    total_corr = len(correlations)
     # Logging for troubleshooting timeline data
     try:
         app.logger.info('Display timeline weeks count=%d', len(last_weeks))
@@ -1071,7 +1240,7 @@ def display():
     # Build server id->name mapping for selector
     lr_servers = get_servers_for('lightrun')
     server_labels = {s.get('id'): (s.get('name') or s.get('id')) for s in lr_servers}
-    return render_template('display.html', timeline=last_weeks, top_users=top_users, servers=server_labels, selected_server=server_id or 'all')
+    return render_template('display.html', timeline=last_weeks, top_users=top_users, correlations=correlations, total_corr=total_corr, servers=server_labels, selected_server=server_id or 'all')
 
 @app.route('/display/week/<week_start>')
 def display_week(week_start):

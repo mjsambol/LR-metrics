@@ -103,35 +103,110 @@
   </div>
 {% endif %}
 
-<div class="d-flex justify-content-between align-items-center mb-2">
-  <h5 class="mb-0">Lightrun Diagnostics Bundles</h5>
-  <a class="btn btn-outline-secondary btn-sm" href="/export/bundles">Download all latest bundles as one zip</a>
-</div>
-{% for sid, files in bundles.items() %}
-  <div class="mb-2">
-    <strong>{{ bundle_labels.get(sid, sid) }}</strong>
-    <ul>
-    {% for f in files[:10] %}
-      <li><a href="/bundles/{{sid}}/{{f}}">{{f}}</a></li>
-    {% endfor %}
-    </ul>
-  </div>
-{% endfor %}
+<style>
+  /* Grid layout to align left/right sections by rows */
+  .retrieval-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto auto; gap: 16px 24px; align-items: start; }
+  .grid-left { grid-column: 1; }
+  .grid-right { grid-column: 2; }
+  .grid-row-1 { grid-row: 1; }
+  .grid-row-2 { grid-row: 2; }
+</style>
 
-{% if gh_reports and gh_reports|length > 0 %}
-  <div class="mt-3">
-    <h5 class="mb-2">GitHub Reports</h5>
-    {% for rid, files in gh_reports.items() %}
+<div class="retrieval-grid mt-2">
+  <div class="grid-left grid-row-1" id="left-bundles">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h5 class="mb-0">Lightrun Diagnostics Bundles</h5>
+    </div>
+    {% for sid, files in bundles.items() %}
       <div class="mb-2">
-        <strong>{{ gh_labels.get(rid, rid) }}</strong>
+        <strong>{{ bundle_labels.get(sid, sid) }}</strong>
         <ul>
         {% for f in files[:10] %}
-          <li><a href="/gh_reports/{{rid}}/{{f}}">{{f}}</a></li>
+          <li><a href="/bundles/{{sid}}/{{f}}">{{f}}</a></li>
         {% endfor %}
         </ul>
       </div>
     {% endfor %}
   </div>
-{% endif %}
+  <div class="grid-right grid-row-1" id="right-download">
+    <a class="btn btn-outline-secondary btn-sm" href="/export/bundles">Download all latest bundles as one zip</a>
+  </div>
+
+  {% if gh_reports and gh_reports|length > 0 %}
+    <div class="grid-left grid-row-2" id="left-gh-reports">
+      <div class="d-flex justify-content-between align-items-center">
+        <h5 class="mb-2">GitHub Reports</h5>
+      </div>
+      {% for rid, files in gh_reports.items() %}
+        <div class="mb-3">
+          <strong>{{ gh_labels.get(rid, rid) }}</strong>
+          <ul>
+          {% for f in files[:10] %}
+            <li><a href="/gh_reports/{{rid}}/{{f}}">{{f}}</a></li>
+          {% endfor %}
+          </ul>
+        </div>
+      {% endfor %}
+    </div>
+
+    <div class="grid-right grid-row-2" id="right-manual-upload">
+      <div class="d-flex align-items-center">
+        <h5 class="mb-2">Manual Git Upload</h5>
+      </div>
+      {% for rid, files in gh_reports.items() %}
+        <div class="mb-3">
+          <strong>{{ gh_labels.get(rid, rid) }}</strong>
+          <div class="mt-2 p-2 border rounded" style="text-align: left;">
+            <div class="mb-1">Upload manually retrieved git history (no token required):</div>
+            <ol class="mb-2">
+              <li>Select your OS, click "Copy command", paste into a terminal at the repo root, run it.</li>
+              <li>It generates a text file in your temp folder; upload that file below.</li>
+            </ol>
+            <div class="d-flex align-items-center gap-2 mb-2">
+              <label class="me-2">OS:</label>
+              <select class="form-select form-select-sm" id="os-select-{{ rid }}" style="max-width: 160px;">
+                <option value="linux">Linux</option>
+                <option value="mac">Mac</option>
+                <option value="windows">Windows</option>
+              </select>
+              <button class="btn btn-outline-secondary btn-sm" type="button" onclick="copyGitCmd('{{ rid }}')">Copy command</button>
+            </div>
+            <div class="form-text" id="cmd-help-{{ rid }}">Command copied to clipboard when you click the button.</div>
+            <form method="post" action="/upload/git-txt" enctype="multipart/form-data" class="mt-2">
+              <input type="hidden" name="repo_id" value="{{ rid }}" />
+              <div class="input-group input-group-sm">
+                <input type="file" name="file" accept="text/plain" class="form-control" />
+                <button class="btn btn-outline-primary btn-sm" type="submit">Upload Git CLI Text</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>
+<!-- Simple stacking: download button then manual upload, no JS alignment -->
+  <script>
+    function copyGitCmd(rid) {
+      const sel = document.getElementById('os-select-' + rid);
+      const os = sel ? sel.value : 'linux';
+      const ts = new Date();
+      const pad = n => (n<10?'0':'') + n;
+      const tsStr = ts.getFullYear().toString()+pad(ts.getMonth()+1)+pad(ts.getDate())+pad(ts.getHours())+pad(ts.getMinutes())+pad(ts.getSeconds());
+      let cmd = '';
+      if (os === 'linux' || os === 'mac') {
+        cmd = `outfile="/tmp/LRmetrics-git-$(date +%Y%m%d%H%M%S).txt"; git log --since=90.days --name-only --date=iso --pretty="%H|%ad|%an" > "$outfile"; echo $outfile`;
+      } else {
+        // Windows CMD (locale dependent date/time). If it fails, user can edit filename manually.
+        cmd = `set "outfile=%TEMP%\\LRmetrics-git-%DATE:~-4%%DATE:~4,2%%DATE:~7,2%-%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%.txt" && git log --since=90.days --name-only --date=iso --pretty="%H|%ad|%an" > "%outfile%" && echo %outfile%`;
+      }
+      navigator.clipboard.writeText(cmd).then(()=>{
+        const help = document.getElementById('cmd-help-' + rid);
+        if (help) help.textContent = 'Command copied. Paste in terminal and run; it will print the output file path.';
+      }).catch(()=>{
+        alert('Failed to copy. Please copy manually.');
+      });
+    }
+  </script>
 
 {% endblock %}
