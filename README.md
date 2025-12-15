@@ -15,7 +15,7 @@ Build the image:
 docker build -t lrmetrics:latest .
 ```
 
-Or use an already available build from [Docker hub](https://hub.docker.com/repository/docker/msambol/lr-metrics/general) e.g. [msambol/lrmetrics:20251207](https://hub.docker.com/repository/docker/msambol/lr-metrics/tags/20251207/sha256-069637ed8c3e342030aa17fc1e9bc34252708acd40a5f0018aa446fd0fbfee6e)
+Or use an already available build from [Docker hub](https://hub.docker.com/repository/docker/msambol/lr-metrics/general) e.g. [msambol/lr-metrics:20251214](https://hub.docker.com/repository/docker/msambol/lr-metrics/tags/20251214/sha256:916445f34b9877ffb038c8138e88e217fcd0278bfca60618f3690fc429ff9839)
 
 Run the container (recommended):
 
