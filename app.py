@@ -216,6 +216,7 @@ def build_correlations(audits_weeks: dict) -> list:
     git_changes = iter_all_git_changes()
     # index git by date->file set
     git_index = {}
+    git_base_index = {}
     for ch in git_changes:
         d = (ch.get('date') or '')[:10]
         files = set([f for f in (ch.get('files') or []) if isinstance(f, str)])
@@ -224,7 +225,21 @@ def build_correlations(audits_weeks: dict) -> list:
         entry = git_index.get(d) or set()
         entry.update(files)
         git_index[d] = entry
+        # build basename -> full paths index per date
+        bmap = git_base_index.get(d) or {}
+        for fp in files:
+            try:
+                bn = os.path.basename(fp)
+            except Exception:
+                bn = fp
+            paths = bmap.get(bn) or []
+            if fp not in paths:
+                paths.append(fp)
+            bmap[bn] = paths
+        git_base_index[d] = bmap
     correlations = []
+    seen = set()
+    ignored_users = {"system", "Agent", "Api Key"}
     for wk, wentry in (audits_weeks or {}).items():
         # iterate usersCounts is not needed; we need raw entries per day, but we only stored weekly counts.
         # Approximate: use actionCounts presence across week days by checking the audits entries again per stored files/dated entries in audits dir.
@@ -260,18 +275,113 @@ def build_correlations(audits_weeks: dict) -> list:
                         continue
                     # match file exact or basename
                     files_on_day = git_index.get(ct) or set()
-                    if file_name in files_on_day or os.path.basename(file_name) in set([os.path.basename(f) for f in files_on_day]):
-                        correlations.append({
+                    chosen_path = None
+                    if file_name in files_on_day:
+                        chosen_path = file_name
+                    else:
+                        bn = os.path.basename(file_name)
+                        cand = [p for p in files_on_day if os.path.basename(p) == bn]
+                        if cand:
+                            chosen_path = cand[0]
+                        else:
+                            chosen_path = (git_base_index.get(ct, {}).get(bn) or [None])[0]
+                    if chosen_path:
+                        usr = e.get('principal')
+                        if usr in ignored_users:
+                            continue
+                        item = {
                             'date': ct,
-                            'file': file_name,
-                            'user': e.get('principal'),
+                            'file': chosen_path,
+                            'user': usr,
                             'action': e.get('action'),
                             'server': sid,
                             'week': wk,
-                        })
+                        }
+                        key = (item['date'], item['file'], item['user'] or '', item['server'])
+                        if key not in seen:
+                            correlations.append(item)
+                            seen.add(key)
+    # Fallback attribution using diagnostics bundles usage summary when audits are missing
+    try:
+        with open(USAGE_SUMMARY_PATH, 'r') as f:
+            usage_summary = json.load(f)
+    except Exception:
+        usage_summary = {}
+    daily_by_server = usage_summary.get('daily_by_server') or {}
+    for sid, dmap in daily_by_server.items():
+        for dstr, entry in dmap.items():
+            # Only count correlations where a filename from usage actionInsights matches a git filename (basename) on the same date
+            if (entry.get('total') or 0) <= 0:
+                continue
+            git_files = git_index.get(dstr) or set()
+            if not git_files:
+                continue
+            usage_files = set(entry.get('files') or [])
+            if not usage_files:
+                continue
+            from os.path import basename
+            git_basenames = set(basename(f) for f in git_files)
+            usage_basenames = set(basename(f) for f in usage_files)
+            matches = git_basenames.intersection(usage_basenames)
+            if not matches:
+                continue
+            users = [u for u in (entry.get('users') or []) if u not in ignored_users]
+            user = users[0] if users else None
+            wk = _week_start(dstr)
+            for bn in matches:
+                # choose a full path from git for display, prefer first path found for that basename
+                cand = [p for p in git_files if os.path.basename(p) == bn]
+                chosen_path = cand[0] if cand else (git_base_index.get(dstr, {}).get(bn) or [bn])[0]
+                if not user:
+                    continue
+                item = {
+                    'date': dstr,
+                    'file': chosen_path,
+                    'user': user,
+                    'action': 'USAGE',
+                    'server': sid,
+                    'week': wk,
+                }
+                key = (item['date'], item['file'], item['user'] or '', item['server'])
+                if key not in seen:
+                    correlations.append(item)
+                    seen.add(key)
     # sort by date desc
     correlations.sort(key=lambda x: x.get('date',''), reverse=True)
     return correlations
+
+def build_and_store_correlations_summary():
+    # Build correlations for all servers and persist to summaries/correlations.json
+    try:
+        # Load audits summary to derive weeks map for 'all'
+        audits_summary = {}
+        try:
+            with open(os.path.join(SUMMARIES_DIR, 'audits_summary.json'), 'r') as f:
+                audits_summary = json.load(f)
+        except Exception:
+            audits_summary = {'weeks': {}}
+        audits_weeks_all = (audits_summary.get('weeks') or {})
+        corr_list = build_correlations(audits_weeks_all)
+        # Group by week
+        weeks = {}
+        for c in corr_list:
+            w = c.get('week')
+            if not w:
+                continue
+            arr = weeks.get(w) or []
+            arr.append(c)
+            weeks[w] = arr
+        out = {
+            'generated_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'scope': 'all',
+            'total': len(corr_list),
+            'weeks': weeks,
+        }
+        os.makedirs(SUMMARIES_DIR, exist_ok=True)
+        with open(os.path.join(SUMMARIES_DIR, 'correlations.json'), 'w') as f:
+            json.dump(out, f, indent=2)
+    except Exception:
+        pass
 # Usage summary paths
 SUMMARIES_DIR = os.path.join(DATA_DIR, 'summaries')
 USAGE_SUMMARY_PATH = os.path.join(SUMMARIES_DIR, 'usage_summary.json')
@@ -338,10 +448,33 @@ def build_usage_summary() -> dict:
                         ul = (((obj.get('userLogin') or {}).get('users')) or [])
                         if isinstance(ul, list):
                             users = [u for u in ul if isinstance(u, str)]
+                        # collect file names affected from actionInsights; match filenames only (ignore paths)
+                        files_set = set()
+                        try:
+                            insights = obj.get('actionInsights') or {}
+                            def _collect_files(x):
+                                try:
+                                    import os as _os
+                                    if isinstance(x, dict):
+                                        for kk, vv in x.items():
+                                            kkl = str(kk).lower()
+                                            if isinstance(vv, str) and ('file' in kkl or kkl in ('filename','file_name')):
+                                                files_set.add(_os.path.basename(vv))
+                                            else:
+                                                _collect_files(vv)
+                                    elif isinstance(x, list):
+                                        for it in x:
+                                            _collect_files(it)
+                                except Exception:
+                                    pass
+                            _collect_files(insights)
+                        except Exception:
+                            pass
                         # overall daily
-                        entry = daily.get(dstr) or {'total': 0, 'users': set(), 'actionCounts': {}}
+                        entry = daily.get(dstr) or {'total': 0, 'users': set(), 'actionCounts': {}, 'files': set()}
                         entry['total'] += total
                         entry['users'].update(users)
+                        entry['files'].update(files_set)
                         if isinstance(actions, dict):
                             ac = entry['actionCounts']
                             for k, v in actions.items():
@@ -351,9 +484,10 @@ def build_usage_summary() -> dict:
                                     pass
                         daily[dstr] = entry
                         # per-server daily
-                        sentry = daily_by_server[sid].get(dstr) or {'total': 0, 'users': set(), 'actionCounts': {}}
+                        sentry = daily_by_server[sid].get(dstr) or {'total': 0, 'users': set(), 'actionCounts': {}, 'files': set()}
                         sentry['total'] += total
                         sentry['users'].update(users)
+                        sentry['files'].update(files_set)
                         if isinstance(actions, dict):
                             sac = sentry['actionCounts']
                             for k, v in actions.items():
@@ -367,9 +501,11 @@ def build_usage_summary() -> dict:
     # convert sets to lists
     for dstr, entry in daily.items():
         entry['users'] = sorted(list(entry['users']))
+        entry['files'] = sorted(list(entry.get('files') or []))
     for sid, dmap in daily_by_server.items():
         for dstr, entry in dmap.items():
             entry['users'] = sorted(list(entry['users']))
+            entry['files'] = sorted(list(entry.get('files') or []))
     # weekly aggregation
     weeks = {}
     weeks_by_server = {}
@@ -576,6 +712,35 @@ def ensure_usage_summary_fresh():
     if needs_rebuild:
         build_usage_summary()
 
+def ensure_audits_summary_fresh():
+    # Rebuild audits summary if missing or older than newest audits file
+    latest_audit_mtime = 0
+    root = AUDITS_DIR
+    for sid in os.listdir(root) if os.path.exists(root) else []:
+        sdir = os.path.join(root, sid)
+        if not os.path.isdir(sdir):
+            continue
+        for f in os.listdir(sdir):
+            if f.endswith('.json'):
+                try:
+                    m = os.path.getmtime(os.path.join(sdir, f))
+                    if m > latest_audit_mtime:
+                        latest_audit_mtime = m
+                except Exception:
+                    continue
+    current_mtime = -1
+    audits_path = os.path.join(SUMMARIES_DIR, 'audits_summary.json')
+    try:
+        if os.path.exists(audits_path):
+            current_mtime = os.path.getmtime(audits_path)
+    except Exception:
+        current_mtime = -1
+    needs_rebuild = (not os.path.exists(audits_path)) or (current_mtime < latest_audit_mtime)
+    if needs_rebuild:
+        try:
+            build_audits_summary()
+        except Exception:
+            pass
 
 def store_retrieved(server, content, ts=None):
     sid = server.get('id')
@@ -955,6 +1120,12 @@ def upload_git_cli():
             flash('Invalid JSON format', 'danger')
             return redirect(url_for('retrieve'))
         store_git_cli_upload(repo_id, data)
+        # Rebuild correlations summary after new git data arrives
+        try:
+            ensure_audits_summary_fresh()
+            build_and_store_correlations_summary()
+        except Exception:
+            pass
         flash('Git CLI data uploaded', 'success')
     except Exception as e:
         flash(f'Upload failed: {e}', 'danger')
@@ -972,6 +1143,12 @@ def upload_git_cli_txt():
         parsed = parse_git_txt(f.stream)
         data = {'repo': repo_id, 'changes': parsed.get('changes') or []}
         store_git_cli_upload(repo_id, data)
+        # Rebuild correlations summary after new git data arrives
+        try:
+            ensure_audits_summary_fresh()
+            build_and_store_correlations_summary()
+        except Exception:
+            pass
         flash('Git CLI text uploaded and parsed', 'success')
     except Exception as e:
         flash(f'Upload failed: {e}', 'danger')
@@ -1114,6 +1291,12 @@ def retrieve():
             completed_repos.append(r.get('name') or full_name)
             _write_progress('github', current='', completed=completed_repos, total=total_overall)
         set_servers_for('github', repos)
+        # After audits and git reports are in place, persist correlations summary
+        try:
+            ensure_audits_summary_fresh()
+            build_and_store_correlations_summary()
+        except Exception:
+            pass
 
         if failures or github_failures:
             flash('Communication with some servers failed. Check the Debug details below.', 'danger')
@@ -1152,22 +1335,38 @@ def retrieve():
     gh_reports = {}
     gh_labels = {}
     gh_root = os.path.join(DATA_DIR, 'github_reports')
+    cli_root = os.path.join(GIT_CLI_DIR)
     for r in repos:
         rid = r['id']
         gh_labels[rid] = r.get('name') or (r.get('full_name') or rid)
         rdir = os.path.join(gh_root, rid)
+        cdir = os.path.join(cli_root, rid)
         files = []
         if os.path.exists(rdir):
             files = sorted([f for f in os.listdir(rdir) if f.endswith('.json')], reverse=True)
-        gh_reports[rid] = files
+        # Append CLI-uploaded JSON files to the list for visibility
+        cli_files = []
+        if os.path.exists(cdir):
+            cli_files = sorted([f for f in os.listdir(cdir) if f.endswith('.json')], reverse=True)
+        gh_reports[rid] = {'api': files, 'cli': cli_files}
 
     total_overall = len(servers) + len(repos)
+    # Ensure summaries exist when visiting retrieval without running a fetch
+    try:
+        ensure_usage_summary_fresh()
+    except Exception:
+        pass
+    try:
+        ensure_audits_summary_fresh()
+    except Exception:
+        pass
     return render_template('retrieval.html', servers=servers, results=results, bundles=bundles, bundle_labels=bundle_labels, github_results=github_results, gh_reports=gh_reports, gh_labels=gh_labels, total_overall=total_overall)
 
 
 @app.route('/display')
 def display():
     ensure_usage_summary_fresh()
+    ensure_audits_summary_fresh()
     summary = {}
     try:
         with open(USAGE_SUMMARY_PATH, 'r') as f:
@@ -1263,7 +1462,7 @@ def display_week(week_start):
 
 @app.route('/export')
 def export():
-    # Rewired to export latest diagnostics bundles zip-of-zips
+    # Export diagnostics_bundles and summaries only
     return export_bundles()
 
 
@@ -1295,43 +1494,40 @@ def serve_gh_report(repo_id, filename):
         return ("Not found", 404)
     return send_file(target, as_attachment=True, download_name=filename)
 
+@app.route('/cli_reports/<repo_id>/<path:filename>')
+def serve_cli_report(repo_id, filename):
+    # Serve stored CLI-uploaded git JSON from DATA_DIR/git_cli/<repo_id>
+    rdir = os.path.join(GIT_CLI_DIR, repo_id)
+    target = os.path.join(rdir, filename)
+    if not os.path.exists(target):
+        return ("Not found", 404)
+    return send_file(target, as_attachment=True, download_name=filename)
+
 
 @app.route('/export/bundles')
 def export_bundles():
-    # Create a zip containing latest bundle for each server and latest GitHub reports
-    servers = get_servers_for('lightrun')
-    repos = get_servers_for('github')
+    # Create a zip containing diagnostics_bundles (all files) and summaries (all files)
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
-        # Lightrun bundles
+        # diagnostics_bundles: include all files recursively
         root = os.path.join(DATA_DIR, 'diagnostics_bundles')
-        for s in servers:
-            sid = s.get('id')
-            sname = (s.get('name') or sid).strip()
-            sdir = os.path.join(root, sid)
-            if not os.path.exists(sdir):
-                continue
-            files = [f for f in os.listdir(sdir) if f.endswith('.zip')]
-            if not files:
-                continue
-            latest = sorted(files, reverse=True)[0]
-            z.write(os.path.join(sdir, latest), arcname=f"lightrun/{sname}/{latest}")
-        # GitHub reports
-        gh_root = os.path.join(DATA_DIR, 'github_reports')
-        for r in repos:
-            rid = r.get('id')
-            rname = (r.get('name') or (r.get('full_name') or rid)).strip()
-            rdir = os.path.join(gh_root, rid)
-            if not os.path.exists(rdir):
-                continue
-            files = [f for f in os.listdir(rdir) if f.endswith('.json')]
-            if not files:
-                continue
-            latest = sorted(files, reverse=True)[0]
-            z.write(os.path.join(rdir, latest), arcname=f"github/{rname}/{latest}")
+        if os.path.exists(root):
+            for dirpath, dirnames, filenames in os.walk(root):
+                for fn in filenames:
+                    fp = os.path.join(dirpath, fn)
+                    # Arcname should be relative under diagnostics_bundles/
+                    rel = os.path.relpath(fp, DATA_DIR)
+                    z.write(fp, arcname=rel)
+        # summaries: include all files
+        if os.path.exists(SUMMARIES_DIR):
+            for fn in os.listdir(SUMMARIES_DIR):
+                fp = os.path.join(SUMMARIES_DIR, fn)
+                if os.path.isfile(fp):
+                    rel = os.path.relpath(fp, DATA_DIR)
+                    z.write(fp, arcname=rel)
     mem.seek(0)
     ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-    return send_file(mem, as_attachment=True, download_name=f"lrmetrics_bundles_{ts}.zip")
+    return send_file(mem, as_attachment=True, download_name=f"lrmetrics_data_{ts}.zip")
 
 
 if __name__ == '__main__':
