@@ -29,13 +29,7 @@ if [ "$cmd" = "run" ]; then
     esac
   done
   mkdir -p "$MOUNT"
-  # Require LRMETRICS_PWD for password protection
-  if [ -z "${LRMETRICS_PWD:-}" ]; then
-    echo "ERROR: LRMETRICS_PWD is not set in the environment." >&2
-    echo "Set a regular password: export LRMETRICS_PWD=\"<your-password>\"" >&2
-    exit 1
-  fi
-  docker run --rm -p 5000:5000 -v "$MOUNT":/data -e LRMETRICS_PWD="$LRMETRICS_PWD" lrmetrics:latest
+  docker run --rm -p 5000:5000 -v "$MOUNT":/data lrmetrics:latest
   exit 0
 fi
 
