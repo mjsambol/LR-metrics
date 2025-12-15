@@ -129,7 +129,7 @@
     {% endfor %}
   </div>
   <div class="grid-right grid-row-1" id="right-download">
-    <a class="btn btn-outline-secondary btn-sm" href="/export/bundles">Download all latest bundles as one zip</a>
+    <a class="btn btn-outline-secondary btn-sm" href="/export">Download bundles and summaries</a>
   </div>
 
   {% if gh_reports and gh_reports|length > 0 %}
@@ -141,8 +141,11 @@
         <div class="mb-3">
           <strong>{{ gh_labels.get(rid, rid) }}</strong>
           <ul>
-          {% for f in files[:10] %}
+          {% for f in (files.api or [])[:10] %}
             <li><a href="/gh_reports/{{rid}}/{{f}}">{{f}}</a></li>
+          {% endfor %}
+          {% for f in (files.cli or [])[:10] %}
+            <li><a href="/cli_reports/{{rid}}/{{f}}">{{f}}</a> <span class="text-muted small">(manual)</span></li>
           {% endfor %}
           </ul>
         </div>
