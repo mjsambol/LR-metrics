@@ -1,0 +1,197 @@
+{% extends 'viewer_base.html' %}
+{% block content %}
+  <style>
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; }
+    .chart { position: relative; height: 360px; margin-bottom: 16px; }
+    .grid-layer { position: absolute; inset: 0; pointer-events: none; }
+    .grid-line { position: absolute; left: 40px; right: 0; height: 1px; background: #e5e7eb; }
+    .grid-label { position: absolute; left: 0; width: 36px; font-size: 11px; color: #666; text-align: right; transform: translateY(-50%); }
+    .weeks { display: grid; grid-template-columns: repeat(13, 1fr); gap: 6px; align-items: end; height: 336px; margin-left: 40px; }
+    .bar { background: #4a90e2; border-radius: 4px; cursor: pointer; width: 14px; }
+    .bar:hover { background: #357ABD; }
+    .label { font-size: 11px; text-align: center; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; }
+    th { background: #f7f7f7; }
+  </style>
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <h2>Usage Overview (Last 13 Weeks)</h2>
+    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('index') }}">Load Another Bundle</a>
+  </div>
+  <form method="get" action="/display" style="margin-bottom: 12px;">
+    <label for="server" style="margin-right:8px">Server:</label>
+    <select id="server" name="server" onchange="this.form.submit()">
+      <option value="all" {{ 'all' == selected_server and 'selected' or '' }}>All servers</option>
+      {% for sid, sname in servers.items() %}
+        <option value="{{ sid }}" {% if selected_server == sid %}selected{% endif %}>{{ sname }}</option>
+      {% endfor %}
+    </select>
+  </form>
+  <div class="grid">
+    <div class="card">
+      <h3>Weekly Timeline</h3>
+      <div class="chart">
+        <div id="grid-layer" class="grid-layer"></div>
+        <div id="weeks" class="weeks"></div>
+      </div>
+      <div id="week-details" class="card" style="margin-top: 16px; display:none">
+        <h4 id="week-title">Week</h4>
+        <div class="grid">
+          <div>
+            <h5>Top Users</h5>
+            <table>
+              <thead><tr><th>User</th><th>Total</th></tr></thead>
+              <tbody id="week-users"></tbody>
+            </table>
+          </div>
+          <div>
+            <h5>Action Types</h5>
+            <table>
+              <thead><tr><th>Action</th><th>Total</th></tr></thead>
+              <tbody id="week-actions"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="display:flex; flex-direction: column; min-height: 360px;">
+      <h3>Top Users (13 Weeks)</h3>
+      <div style="flex: 1 1 auto;">
+        <table>
+          <thead><tr><th>User</th><th>Total</th></tr></thead>
+          <tbody id="top-users"></tbody>
+        </table>
+      </div>
+      <div class="mt-3" style="margin-top: auto;">
+        <strong>Total Correlations:</strong> <span id="total-corr">{{ total_corr }}</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px;">
+    <h3>Lightrun ↔ Git Correlations</h3>
+    <table>
+      <thead><tr><th>Date</th><th>File</th><th>User</th><th>Action</th><th>Server</th></tr></thead>
+      <tbody id="corr-body"></tbody>
+    </table>
+  </div>
+
+  <script type="application/json" id="timeline-data">{{ timeline | tojson }}</script>
+  <script type="application/json" id="top-users-data">{{ top_users | tojson }}</script>
+  <script type="application/json" id="corr-data">{{ correlations | tojson }}</script>
+  <script>
+    const timeline = JSON.parse(document.getElementById('timeline-data').textContent);
+    const topUsers = JSON.parse(document.getElementById('top-users-data').textContent);
+    const correlations = JSON.parse(document.getElementById('corr-data').textContent);
+    const totalCorrEl = document.getElementById('total-corr');
+    timeline.sort((a, b) => (a.week > b.week ? 1 : -1));
+    const maxTotal = Math.max(1, ...timeline.map(t => t.total || 0));
+    const CH = 360;
+    const PAD_BOTTOM = 24;
+    const CHI = CH - PAD_BOTTOM;
+    const weeksEl = document.getElementById('weeks');
+    const gridLayer = document.getElementById('grid-layer');
+    const rawStep = Math.ceil(maxTotal / 5);
+    let step = rawStep < 10 ? rawStep : Math.max(10, Math.round(rawStep / 10) * 10);
+    if (!Number.isFinite(step) || step <= 0) step = 1;
+    for (let v = step; v <= maxTotal; v += step) {
+      const y = Math.round(PAD_BOTTOM + (CHI - (v / maxTotal) * CHI));
+      const line = document.createElement('div');
+      line.className = 'grid-line';
+      line.style.top = `${y}px`;
+      const lab = document.createElement('div');
+      lab.className = 'grid-label';
+      lab.style.top = `${y}px`;
+      lab.textContent = String(v);
+      gridLayer.appendChild(line);
+      gridLayer.appendChild(lab);
+    }
+    timeline.forEach(item => {
+      let h = Math.round(((item.total || 0) / maxTotal) * CHI);
+      if (h === 0 && (item.total || 0) > 0) h = 2;
+      const wrap = document.createElement('div');
+      wrap.style.display = 'flex';
+      wrap.style.flexDirection = 'column';
+      wrap.style.alignItems = 'center';
+      const bar = document.createElement('div');
+      bar.className = 'bar';
+      bar.style.height = `${h}px`;
+      bar.title = `${item.week}: ${item.total}`;
+      bar.onclick = () => loadWeek(item.week);
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = item.week.slice(5);
+      wrap.appendChild(bar);
+      wrap.appendChild(label);
+      weeksEl.appendChild(wrap);
+    });
+
+    const tuEl = document.getElementById('top-users');
+    (topUsers || []).slice(0, 25).forEach(u => {
+      const tr = document.createElement('tr');
+      const tdU = document.createElement('td'); tdU.textContent = u.user;
+      const tdT = document.createElement('td'); tdT.textContent = u.total;
+      tr.appendChild(tdU); tr.appendChild(tdT);
+      tuEl.appendChild(tr);
+    });
+
+    async function loadWeek(week) {
+      try {
+        const server = document.getElementById('server')?.value || 'all';
+        const res = await fetch(`/display/week/${week}?server=${encodeURIComponent(server)}`);
+        const data = await res.json();
+        document.getElementById('week-details').style.display = 'block';
+        document.getElementById('week-title').textContent = `Week ${week}`;
+        const wu = document.getElementById('week-users');
+        wu.innerHTML = '';
+        (data.users || []).slice(0, 50).forEach(u => {
+          const tr = document.createElement('tr');
+          const tdU = document.createElement('td'); tdU.textContent = u.user;
+          const tdT = document.createElement('td'); tdT.textContent = u.total;
+          tr.appendChild(tdU); tr.appendChild(tdT);
+          wu.appendChild(tr);
+        });
+        const wa = document.getElementById('week-actions');
+        wa.innerHTML = '';
+        const actions = data.actions || {};
+        Object.keys(actions).sort((a,b)=>actions[b]-actions[a]).forEach(k => {
+          const tr = document.createElement('tr');
+          const tdK = document.createElement('td'); tdK.textContent = k;
+          const tdV = document.createElement('td'); tdV.textContent = actions[k];
+          tr.appendChild(tdK); tr.appendChild(tdV);
+          wa.appendChild(tr);
+        });
+        const corrEl = document.getElementById('corr-body');
+        corrEl.innerHTML = '';
+        const filtered = (correlations || []).filter(c => c.week === week);
+        filtered.slice(0, 200).forEach(c => {
+          const tr = document.createElement('tr');
+          const tdD = document.createElement('td'); tdD.textContent = c.date;
+          const tdF = document.createElement('td'); tdF.textContent = c.file;
+          const tdU = document.createElement('td'); tdU.textContent = c.user;
+          const tdA = document.createElement('td'); tdA.textContent = c.action;
+          const tdS = document.createElement('td'); tdS.textContent = c.server;
+          tr.appendChild(tdD); tr.appendChild(tdF); tr.appendChild(tdU); tr.appendChild(tdA); tr.appendChild(tdS);
+          corrEl.appendChild(tr);
+        });
+        if (totalCorrEl) totalCorrEl.textContent = filtered.length;
+      } catch (e) {
+        console.error('Failed to load week', e);
+      }
+    }
+
+    const corrEl = document.getElementById('corr-body');
+    (correlations || []).slice(0, 200).forEach(c => {
+      const tr = document.createElement('tr');
+      const tdD = document.createElement('td'); tdD.textContent = c.date;
+      const tdF = document.createElement('td'); tdF.textContent = c.file;
+      const tdU = document.createElement('td'); tdU.textContent = c.user;
+      const tdA = document.createElement('td'); tdA.textContent = c.action;
+      const tdS = document.createElement('td'); tdS.textContent = c.server;
+      tr.appendChild(tdD); tr.appendChild(tdF); tr.appendChild(tdU); tr.appendChild(tdA); tr.appendChild(tdS);
+      corrEl.appendChild(tr);
+    });
+    if (totalCorrEl) totalCorrEl.textContent = (correlations || []).length;
+  </script>
+{% endblock %}

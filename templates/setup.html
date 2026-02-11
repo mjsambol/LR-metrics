@@ -4,12 +4,17 @@
   <div class="col-md-3">
     <h5>Sources</h5>
     <div class="list-group">
-      <a href="?src=lightrun" class="list-group-item list-group-item-action {% if src=='lightrun' %}active{% endif %}">Lightrun Servers</a>
-      <a href="?src=github" class="list-group-item list-group-item-action {% if src=='github' %}active{% endif %}">Github Repositories</a>
-      <a href="?src=jira" class="list-group-item list-group-item-action {% if src=='jira' %}active{% endif %}">Jira Spaces</a>
+      <a href="{{ v2_url('setup', src='lightrun') }}" class="list-group-item list-group-item-action {% if src=='lightrun' %}active{% endif %}">Lightrun Servers</a>
+      <a href="{{ v2_url('setup', src='github') }}" class="list-group-item list-group-item-action {% if src=='github' %}active{% endif %}">Github Repositories</a>
+      <a href="{{ v2_url('setup', src='jira') }}" class="list-group-item list-group-item-action {% if src=='jira' %}active{% endif %}">Jira Spaces</a>
     </div>
   </div>
   <div class="col-md-9">
+    {% if master_password_warning %}
+      <div class="alert alert-warning py-2">
+        {{ master_password_warning }}
+      </div>
+    {% endif %}
     {% if src == 'lightrun' %}
       <div class="d-flex justify-content-between align-items-center">
         <h3>Lightrun Servers</h3>
@@ -160,6 +165,11 @@
 
 <script>
 // Setup page script: selection, edit/remove, and add-form test/save flow
+const V2_QS = {{ v2_mode_qs | tojson }};
+function withV2(url){
+  if(!V2_QS) return url;
+  return url.includes('?') ? `${url}&v2=1` : `${url}${V2_QS}`;
+}
 function selectedServerId(){
   const sel = document.querySelector('input[name="selected_server"]:checked');
   return sel ? sel.value : null;
@@ -174,7 +184,7 @@ function updateActionButtons(){
 function editSelected(){
   const id = selectedServerId();
   if(!id) return;
-  window.location.href = `/setup/edit/{{src}}/${id}`;
+  window.location.href = withV2(`/setup/edit/{{src}}/${id}`);
 }
 
 function removeSelected(){
@@ -182,7 +192,7 @@ function removeSelected(){
   if(!id) return;
   if(!confirm('Remove selected server?')) return;
   const form = document.getElementById('delete-form');
-  form.action = `/setup/delete/{{src}}/${id}`;
+  form.action = withV2(`/setup/delete/{{src}}/${id}`);
   form.submit();
 }
 
@@ -212,7 +222,7 @@ document.addEventListener('DOMContentLoaded', function(){
       if(!/[^@]+@[^@]+\.[^@]+/.test(email)){ alert('Invalid email'); return; }
       try{
         const fd = new FormData(); fd.append('url', url); fd.append('email', email); fd.append('password', password);
-        const res = await fetch(`/setup/test-params/{{src}}`, {method:'POST', body: fd});
+        const res = await fetch(withV2(`/setup/test-params/{{src}}`), {method:'POST', body: fd});
         const j = await res.json();
         if(j.ok){
           let parts = [];
@@ -256,7 +266,7 @@ document.addEventListener('DOMContentLoaded', function(){
       if(!/^\S+\/\S+$/.test(full)){ alert("Repository must be 'owner/repo'"); return; }
       try{
         const fd = new FormData(); fd.append('full_name', full); fd.append('token', token); if(api) fd.append('api_base', api);
-        const res = await fetch(`/setup/test-params/github`, {method:'POST', body: fd});
+        const res = await fetch(withV2(`/setup/test-params/github`), {method:'POST', body: fd});
         const j = await res.json();
         if(j.ok){
           statusEl.innerHTML = `<span class="badge bg-success">OK</span>`;

@@ -57,11 +57,27 @@ def start_diagnostics(base: str, cookie: Dict[str, str], body: Dict[str, Any], t
     return False, resp.status_code, snippet
 
 
-def poll_diagnostics_status(base: str, cookie: Dict[str, str], timeout: int = 20, verify: bool = False, max_iters: int = 120) -> Dict[str, Any]:
+def poll_diagnostics_status(
+    base: str,
+    cookie: Dict[str, str],
+    timeout: int = 20,
+    verify: bool = False,
+    max_iters: int = 120,
+    max_wait_seconds: float = 600.0,
+) -> Dict[str, Any]:
     import time
     url = f"{base.rstrip('/')}/athena/diagnostics/status"
+    start = time.monotonic()
     for _ in range(max_iters):
-        resp = requests.get(url, cookies=cookie or {}, timeout=timeout, verify=verify)
+        elapsed = time.monotonic() - start
+        remaining = max_wait_seconds - elapsed
+        if remaining <= 0:
+            return {'status': 'TIMEOUT', 'reason': 'poll deadline reached'}
+        req_timeout = min(float(timeout), max(1.0, remaining))
+        try:
+            resp = requests.get(url, cookies=cookie or {}, timeout=req_timeout, verify=verify)
+        except requests.RequestException as e:
+            return {'error': 'Status failed', 'reason': str(e)}
         if resp.status_code != 200:
             return {'error': 'Status failed', 'status': resp.status_code}
         try:
@@ -71,8 +87,12 @@ def poll_diagnostics_status(base: str, cookie: Dict[str, str], timeout: int = 20
         if (sj.get('status') or '').upper() == 'COMPLETED':
             return {'status': 'COMPLETED'}
         cooldown = int(sj.get('cooldownMs') or 1000)
-        time.sleep(min(max(cooldown/1000.0, 0.5), 2.0))
-    return {'status': 'TIMEOUT'}
+        sleep_seconds = min(max(cooldown / 1000.0, 0.5), 2.0)
+        remaining_after_call = max_wait_seconds - (time.monotonic() - start)
+        if remaining_after_call <= 0:
+            return {'status': 'TIMEOUT', 'reason': 'poll deadline reached'}
+        time.sleep(min(sleep_seconds, remaining_after_call))
+    return {'status': 'TIMEOUT', 'reason': f'max iterations reached ({max_iters})'}
 
 
 def download_diagnostics(base: str, cookie: Dict[str, str], timeout: int = 60, verify: bool = False) -> Tuple[int, Dict[str, str], bytes]:

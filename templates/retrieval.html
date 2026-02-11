@@ -3,10 +3,11 @@
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h3>Retrieval</h3>
   <div class="position-relative" style="min-width: 280px; text-align: right;">
-    <form id="retrieveForm" method="post" style="display: inline;">
+    <form id="retrieveForm" style="display: inline;">
       <button id="retrieveBtn" class="btn btn-primary">Fetch Latest From All Servers</button>
     </form>
     <span id="totalOverall" data-total="{{ total_overall or 0 }}" style="display:none"></span>
+    <span id="activeJobId" data-job-id="{{ active_job_id or '' }}" style="display:none"></span>
     <div id="loadingIndicator" class="position-absolute end-0" style="top: 50%; transform: translateY(-50%); display:none;">
       <span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
       <span class="ms-1">Fetching…</span>
@@ -15,48 +16,97 @@
   </div>
   <script>
     (function(){
+      const V2_QS = {{ v2_mode_qs | tojson }};
+      function withV2(url){
+        if(!V2_QS) return url;
+        return url.includes('?') ? `${url}&v2=1` : `${url}${V2_QS}`;
+      }
       const totalEl = document.getElementById('totalOverall');
       window.TOTAL_OVERALL = totalEl ? parseInt(totalEl.getAttribute('data-total')) || 0 : 0;
+      const activeJobIdEl = document.getElementById('activeJobId');
       const form = document.getElementById('retrieveForm');
       const btn = document.getElementById('retrieveBtn');
       const loading = document.getElementById('loadingIndicator');
       const progressText = document.getElementById('progressText');
       let timer = null;
-      if (form) {
-        form.addEventListener('submit', function(){
-          if (btn) { btn.style.visibility = 'hidden'; btn.disabled = true; }
-          if (loading) loading.style.display = 'block';
-          // poll unified server progress once per second
-          timer = setInterval(async function(){
-            const total = window.TOTAL_OVERALL || 0;
-            let completedSum = 0;
-            let currentName = '';
-            let phaseLabel = '';
-            try {
-              const res = await fetch('/progress');
-              const all = await res.json();
-              const lr = all.lightrun || {};
-              const gh = all.github || {};
-              completedSum += ((lr.completed || []).length + (gh.completed || []).length);
-              if (!currentName && lr.current) { currentName = lr.current; phaseLabel = 'Lightrun'; }
-              if (!currentName && gh.current) { currentName = gh.current; phaseLabel = 'GitHub'; }
-            } catch (e) {}
-            let text = `Completed: ${completedSum}/${total}`;
-            if (currentName) {
-              if (phaseLabel) {
-                text = `${text} · Now fetching: ${phaseLabel} · ${currentName}`;
-              } else {
-                text = `${text} · Now fetching: ${currentName}`;
-              }
+
+      function setLoading(isLoading) {
+        if (btn) {
+          btn.style.visibility = isLoading ? 'hidden' : 'visible';
+          btn.disabled = !!isLoading;
+        }
+        if (loading) loading.style.display = isLoading ? 'block' : 'none';
+      }
+
+      function renderProgress(payload) {
+        const progress = (payload && payload.progress) || {};
+        const total = Number(progress.total || window.TOTAL_OVERALL || 0);
+        const completed = Number(progress.completed || 0);
+        const current = progress.current || '';
+        const phase = progress.phase || '';
+        let text = `Completed: ${completed}/${total}`;
+        if (current) {
+          text = phase ? `${text} · Now fetching: ${phase} · ${current}` : `${text} · Now fetching: ${current}`;
+        }
+        if (progressText) progressText.textContent = text;
+      }
+
+      function startPolling(jobId) {
+        if (!jobId) return;
+        if (timer) clearInterval(timer);
+        setLoading(true);
+        timer = setInterval(async function(){
+          try {
+            const res = await fetch(withV2(`/retrieve/status/${encodeURIComponent(jobId)}`));
+            if (!res.ok) throw new Error(`status ${res.status}`);
+            const payload = await res.json();
+            renderProgress(payload);
+            const state = payload.state || '';
+            if (state !== 'running') {
+              clearInterval(timer);
+              timer = null;
+              window.location.href = withV2(`/retrieve?job_id=${encodeURIComponent(jobId)}&notify=1`);
             }
-            if (progressText) progressText.textContent = text;
-          }, 1000);
+          } catch (e) {
+            if (progressText) progressText.textContent = 'Fetching progress…';
+          }
+        }, 1000);
+      }
+
+      if (form) {
+        form.addEventListener('submit', async function(ev){
+          ev.preventDefault();
+          setLoading(true);
+          try {
+            const res = await fetch(withV2('/retrieve/start'), { method: 'POST' });
+            const payload = await res.json();
+            if (!res.ok && res.status !== 409) {
+              throw new Error(payload.error || 'Failed to start retrieval');
+            }
+            const jobId = payload.job_id;
+            if (!jobId) throw new Error('Missing job id');
+            startPolling(jobId);
+          } catch (e) {
+            setLoading(false);
+            if (progressText) progressText.textContent = '';
+            alert(e && e.message ? e.message : 'Failed to start retrieval');
+          }
         });
       }
-      // When page reloads after POST completes, button becomes visible again
+
+      const activeJobId = activeJobIdEl ? activeJobIdEl.getAttribute('data-job-id') : '';
+      if (activeJobId) {
+        startPolling(activeJobId);
+      }
     })();
   </script>
 </div>
+
+{% if master_password_warning %}
+  <div class="alert alert-warning py-2">
+    {{ master_password_warning }}
+  </div>
+{% endif %}
 
 <div class="alert alert-info py-2">
   Diagnostic bundles are stored locally to the LRmetrics application. They are not automatically transmitted to any system or entity. Please download them and transfer them manually.
@@ -122,14 +172,14 @@
         <strong>{{ bundle_labels.get(sid, sid) }}</strong>
         <ul>
         {% for f in files[:10] %}
-          <li><a href="/bundles/{{sid}}/{{f}}">{{f}}</a></li>
+          <li><a href="{{ v2_path('/bundles/' ~ sid ~ '/' ~ f) }}">{{f}}</a></li>
         {% endfor %}
         </ul>
       </div>
     {% endfor %}
   </div>
   <div class="grid-right grid-row-1" id="right-download">
-    <a class="btn btn-outline-secondary btn-sm" href="/export">Download bundles and summaries</a>
+    <a class="btn btn-outline-secondary btn-sm" href="{{ v2_path('/export') }}">Download bundles and summaries</a>
   </div>
 
   {% if gh_reports and gh_reports|length > 0 %}
@@ -142,10 +192,10 @@
           <strong>{{ gh_labels.get(rid, rid) }}</strong>
           <ul>
           {% for f in (files.api or [])[:10] %}
-            <li><a href="/gh_reports/{{rid}}/{{f}}">{{f}}</a></li>
+            <li><a href="{{ v2_path('/gh_reports/' ~ rid ~ '/' ~ f) }}">{{f}}</a></li>
           {% endfor %}
           {% for f in (files.cli or [])[:10] %}
-            <li><a href="/cli_reports/{{rid}}/{{f}}">{{f}}</a> <span class="text-muted small">(manual)</span></li>
+            <li><a href="{{ v2_path('/cli_reports/' ~ rid ~ '/' ~ f) }}">{{f}}</a> <span class="text-muted small">(manual)</span></li>
           {% endfor %}
           </ul>
         </div>
@@ -175,7 +225,7 @@
               <button class="btn btn-outline-secondary btn-sm" type="button" onclick="copyGitCmd('{{ rid }}')">Copy command</button>
             </div>
             <div class="form-text" id="cmd-help-{{ rid }}">Command copied to clipboard when you click the button.</div>
-            <form method="post" action="/upload/git-txt" enctype="multipart/form-data" class="mt-2">
+            <form method="post" action="{{ v2_path('/upload/git-txt') }}" enctype="multipart/form-data" class="mt-2">
               <input type="hidden" name="repo_id" value="{{ rid }}" />
               <div class="input-group input-group-sm">
                 <input type="file" name="file" accept="text/plain" class="form-control" />

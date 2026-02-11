@@ -14,9 +14,11 @@
     table { width: 100%; border-collapse: collapse; }
     th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; }
     th { background: #f7f7f7; }
+    td.path-cell { word-break: normal; overflow-wrap: anywhere; }
+    td.path-cell .path-wrap { white-space: normal; }
   </style>
   <h2>Usage Overview (Last 13 Weeks)</h2>
-  <form method="get" action="/display" style="margin-bottom: 12px;">
+  <form method="get" action="{{ v2_path('/display') }}" style="margin-bottom: 12px;">
     <label for="server" style="margin-right:8px">Server:</label>
     <select id="server" name="server" onchange="this.form.submit()">
       <option value="" {{ 'all' == selected_server and 'selected' or '' }}>All servers</option>
@@ -68,10 +70,12 @@
 
   <div class="card" style="margin-top:16px;">
     <h3>Lightrun ↔ Git Correlations</h3>
-    <table>
-      <thead><tr><th>Date</th><th>File</th><th>User</th><th>Action</th><th>Server</th></tr></thead>
-      <tbody id="corr-body"></tbody>
-    </table>
+    <div class="table-responsive">
+      <table>
+        <thead><tr><th>Date</th><th>File</th><th>User</th><th>Action</th><th>Server</th></tr></thead>
+        <tbody id="corr-body"></tbody>
+      </table>
+    </div>
   </div>
 
     <script type="application/json" id="timeline-data">{{ timeline | tojson }}</script>
@@ -81,7 +85,12 @@
         const timeline = JSON.parse(document.getElementById('timeline-data').textContent);
         const topUsers = JSON.parse(document.getElementById('top-users-data').textContent);
       const correlations = JSON.parse(document.getElementById('corr-data').textContent);
-          const totalCorrEl = document.getElementById('total-corr');
+      const totalCorrEl = document.getElementById('total-corr');
+      const V2_QS = {{ v2_mode_qs | tojson }};
+      function withV2(url){
+        if(!V2_QS) return url;
+        return url.includes('?') ? `${url}&v2=1` : `${url}${V2_QS}`;
+      }
         console.log('timeline data:', timeline);
         console.log('top users:', topUsers);
       // Oldest to newest left-to-right
@@ -140,7 +149,8 @@
 
       async function loadWeek(week) {
         try {
-          const res = await fetch(`/display/week/${week}`);
+          const selectedServer = document.getElementById('server')?.value || 'all';
+          const res = await fetch(withV2(`/display/week/${week}?server=${encodeURIComponent(selectedServer)}`));
           const data = await res.json();
           document.getElementById('week-details').style.display = 'block';
           document.getElementById('week-title').textContent = `Week ${week}`;
@@ -170,7 +180,12 @@
             filtered.slice(0, 200).forEach(c => {
               const tr = document.createElement('tr');
               const tdD = document.createElement('td'); tdD.textContent = c.date;
-              const tdF = document.createElement('td'); tdF.textContent = c.file;
+              const tdF = document.createElement('td');
+              tdF.className = 'path-cell';
+              const fileSpan = document.createElement('span');
+              fileSpan.className = 'path-wrap';
+              fileSpan.innerHTML = formatPathForWrap(c.file || '');
+              tdF.appendChild(fileSpan);
               const tdU = document.createElement('td'); tdU.textContent = c.user;
               const tdA = document.createElement('td'); tdA.textContent = c.action;
               const tdS = document.createElement('td'); tdS.textContent = c.server;
@@ -184,10 +199,35 @@
       }
         // Render initial correlations (all time/selected server)
         const corrEl = document.getElementById('corr-body');
+      function escapeHtml(s){
+        return String(s || '')
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;');
+      }
+      function formatPathForWrap(path){
+        // Allow wraps only between path components, not inside the final filename.
+        const raw = String(path || '');
+        const i1 = raw.lastIndexOf('/');
+        const i2 = raw.lastIndexOf('\\');
+        const cut = Math.max(i1, i2);
+        if (cut < 0) return escapeHtml(raw);
+        const dirPart = raw.slice(0, cut + 1);
+        const filePart = raw.slice(cut + 1);
+        const wrappedDir = escapeHtml(dirPart)
+          .replaceAll('/', '/<wbr>')
+          .replaceAll('\\', '\\<wbr>');
+        return wrappedDir + escapeHtml(filePart);
+      }
         (correlations || []).slice(0, 200).forEach(c => {
           const tr = document.createElement('tr');
           const tdD = document.createElement('td'); tdD.textContent = c.date;
-          const tdF = document.createElement('td'); tdF.textContent = c.file;
+        const tdF = document.createElement('td');
+        tdF.className = 'path-cell';
+        const fileSpan = document.createElement('span');
+        fileSpan.className = 'path-wrap';
+        fileSpan.innerHTML = formatPathForWrap(c.file || '');
+        tdF.appendChild(fileSpan);
           const tdU = document.createElement('td'); tdU.textContent = c.user;
           const tdA = document.createElement('td'); tdA.textContent = c.action;
           const tdS = document.createElement('td'); tdS.textContent = c.server;

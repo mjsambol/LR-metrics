@@ -31,9 +31,19 @@ docker run \
 
 Replace `lrmetrics:latest` with the appropriate image reference if not using a locally built image.
 
+Run the standalone bundle viewer in Docker:
+
+```bash
+docker run --rm -p 5001:5001 lrmetrics:latest \
+  gunicorn --bind 0.0.0.0:5001 viewer_app:app --workers 1 --timeout 180
+```
+
+Visit http://localhost:5001
+
 
 - `FLASK_SECRET` secures the web session. Always set it in production.
 - The mounted volume keeps your configuration and downloaded bundles between container restarts.
+- For large retrieval jobs, you can tune worker timeout with `GUNICORN_TIMEOUT` (default is `180` seconds in this image).
 
 Master password and data security
 ---------------------------------
@@ -106,11 +116,25 @@ Local development helpers are provided via `run.sh`.
 # Create a virtualenv and run locally on port 5000
 ./run.sh run-dev
 
+# Run the standalone export-bundle viewer on port 5001
+./run.sh run-viewer-dev
+
 # Rebuild the Docker image from this folder
 ./run.sh build
 
 # Run the built container, mounting a local data folder
 ./run.sh run --mount $(pwd)/lrmetrics_data
+
+# Run the standalone bundle viewer in Docker (port 5001)
+./run.sh run-viewer
 ```
+
+Standalone Bundle Viewer
+------------------------
+`viewer_app.py` provides a separate entry point focused only on visualizing an exported LRmetrics bundle.
+
+- No setup/retrieval workflow and no login.
+- Upload an export zip, it is extracted to a temporary directory, and dashboards are rendered from the bundle contents.
+- Data is not persisted across process restarts.
 
 In development, the app uses a default session secret if `FLASK_SECRET` is not provided. Do not use this default in production.

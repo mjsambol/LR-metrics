@@ -2,6 +2,11 @@
 {% block content %}
 <div class="row">
   <div class="col-md-8">
+    {% if master_password_warning %}
+      <div class="alert alert-warning py-2">
+        {{ master_password_warning }}
+      </div>
+    {% endif %}
     <h3>Edit {{ server.name }}</h3>
     <form id="edit-server-form" method="post">
       <div class="mb-3">
@@ -23,7 +28,7 @@
       <div class="d-flex gap-2">
         <button id="btn-edit-test" type="button" class="btn btn-outline-secondary">Test</button>
         <button id="btn-edit-save" class="btn btn-primary" disabled>Save</button>
-        <a class="btn btn-secondary" href="{{ url_for('setup', src=src) }}">Cancel</a>
+        <a class="btn btn-secondary" href="{{ v2_url('setup', src=src) }}">Cancel</a>
         <span id="edit-test-status" class="align-self-center ms-2"></span>
       </div>
     </form>
@@ -31,6 +36,11 @@
 </div>
 <script>
 document.addEventListener('DOMContentLoaded', function(){
+  const V2_QS = {{ v2_mode_qs | tojson }};
+  function withV2(url){
+    if(!V2_QS) return url;
+    return url.includes('?') ? `${url}&v2=1` : `${url}${V2_QS}`;
+  }
   const testBtn = document.getElementById('btn-edit-test');
   const saveBtn = document.getElementById('btn-edit-save');
   const statusEl = document.getElementById('edit-test-status');
@@ -43,7 +53,7 @@ document.addEventListener('DOMContentLoaded', function(){
     if(!/[^@]+@[^@]+\.[^@]+/.test(email)){ alert('Invalid email'); return; }
     try{
       const fd = new FormData(); fd.append('url', url); fd.append('email', email); fd.append('password', password);
-      const res = await fetch(`/setup/test-params/{{src}}`, {method:'POST', body: fd});
+      const res = await fetch(withV2(`/setup/test-params/{{src}}`), {method:'POST', body: fd});
       const j = await res.json();
       if(j.ok){
         let parts = [];

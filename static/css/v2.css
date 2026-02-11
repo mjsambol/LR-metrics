@@ -1,0 +1,192 @@
+/* Alternate UI theme enabled via ?v2=1 */
+
+body.v2-theme {
+  background: radial-gradient(circle at top right, #172554 0%, #0b1220 45%, #090f1a 100%);
+  background-repeat: no-repeat;
+  background-size: 100% 100vh;
+  background-color: #090f1a;
+  color: #e5e7eb;
+}
+
+body.v2-theme .lr-navbar {
+  background: linear-gradient(90deg, #111827, #1f2937);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+  box-shadow: 0 8px 20px rgba(2, 6, 23, 0.35);
+}
+
+body.v2-theme .navbar-brand,
+body.v2-theme .navbar .nav-link {
+  color: #e5e7eb !important;
+}
+
+body.v2-theme .navbar .nav-link.active {
+  background: rgba(56, 189, 248, 0.18);
+  color: #7dd3fc !important;
+  border-radius: 8px;
+}
+
+body.v2-theme main.container {
+  max-width: 1240px;
+}
+
+body.v2-theme .card,
+body.v2-theme .list-group-item,
+body.v2-theme .table,
+body.v2-theme .retrieval-grid > div {
+  background: rgba(15, 23, 42, 0.86);
+  border-color: rgba(148, 163, 184, 0.24);
+  color: #e5e7eb;
+  border-radius: 12px;
+  box-shadow: 0 14px 26px rgba(2, 6, 23, 0.26);
+}
+
+body.v2-theme .card {
+  overflow: hidden;
+}
+
+body.v2-theme .table-responsive {
+  overflow-x: auto;
+}
+
+body.v2-theme h1,
+body.v2-theme h2,
+body.v2-theme h3,
+body.v2-theme h4,
+body.v2-theme h5 {
+  color: #f8fafc;
+  letter-spacing: 0.2px;
+}
+
+body.v2-theme .text-muted,
+body.v2-theme .form-text {
+  color: #94a3b8 !important;
+}
+
+body.v2-theme .alert {
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 10px;
+}
+
+body.v2-theme .alert-info {
+  background: rgba(2, 132, 199, 0.2);
+  color: #bae6fd;
+}
+
+body.v2-theme .alert-warning {
+  background: rgba(217, 119, 6, 0.2);
+  color: #fde68a;
+}
+
+body.v2-theme .alert-success {
+  background: rgba(5, 150, 105, 0.18);
+  color: #a7f3d0;
+}
+
+body.v2-theme .alert-danger {
+  background: rgba(220, 38, 38, 0.2);
+  color: #fecaca;
+}
+
+body.v2-theme .btn-primary {
+  background: linear-gradient(90deg, #0ea5e9, #2563eb);
+  border: none;
+}
+
+body.v2-theme .btn-primary:hover {
+  filter: brightness(1.06);
+}
+
+body.v2-theme .btn-outline-secondary,
+body.v2-theme .btn-outline-primary,
+body.v2-theme .btn-outline-danger,
+body.v2-theme .btn-secondary {
+  border-color: rgba(148, 163, 184, 0.45);
+  color: #e5e7eb;
+}
+
+body.v2-theme .btn-outline-secondary:hover,
+body.v2-theme .btn-outline-primary:hover,
+body.v2-theme .btn-outline-danger:hover,
+body.v2-theme .btn-secondary:hover {
+  background: rgba(148, 163, 184, 0.15);
+  color: #fff;
+}
+
+body.v2-theme .form-control,
+body.v2-theme .form-select {
+  background: rgba(15, 23, 42, 0.8);
+  border-color: rgba(148, 163, 184, 0.35);
+  color: #e5e7eb;
+}
+
+body.v2-theme .form-control::placeholder,
+body.v2-theme .form-select::placeholder {
+  color: #94a3b8;
+  opacity: 1;
+}
+
+body.v2-theme input:-webkit-autofill,
+body.v2-theme input:-webkit-autofill:hover,
+body.v2-theme input:-webkit-autofill:focus,
+body.v2-theme textarea:-webkit-autofill,
+body.v2-theme select:-webkit-autofill {
+  -webkit-text-fill-color: #e5e7eb;
+  box-shadow: 0 0 0px 1000px rgba(15, 23, 42, 0.92) inset;
+  transition: background-color 9999s ease-in-out 0s;
+}
+
+body.v2-theme .form-control:focus,
+body.v2-theme .form-select:focus {
+  border-color: #38bdf8;
+  box-shadow: 0 0 0 0.2rem rgba(56, 189, 248, 0.2);
+}
+
+body.v2-theme a {
+  color: #7dd3fc;
+}
+
+body.v2-theme a:hover {
+  color: #bae6fd;
+}
+
+body.v2-theme pre {
+  background: #020617 !important;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+body.v2-theme .grid-line {
+  background: rgba(148, 163, 184, 0.24) !important;
+}
+
+body.v2-theme .grid-label,
+body.v2-theme .label {
+  color: #cbd5e1 !important;
+}
+
+body.v2-theme table {
+  color: #e5e7eb;
+}
+
+body.v2-theme th {
+  background: rgba(30, 41, 59, 0.9) !important;
+  color: #e5e7eb !important;
+  border-bottom-color: rgba(148, 163, 184, 0.35) !important;
+}
+
+body.v2-theme td {
+  color: #e5e7eb !important;
+  border-bottom-color: rgba(148, 163, 184, 0.2) !important;
+}
+
+body.v2-theme td.path-cell {
+  max-width: 520px;
+  white-space: normal;
+}
+
+body.v2-theme .bar {
+  background: linear-gradient(180deg, #38bdf8, #2563eb) !important;
+}
+
+body.v2-theme .bar:hover {
+  background: linear-gradient(180deg, #7dd3fc, #3b82f6) !important;
+}

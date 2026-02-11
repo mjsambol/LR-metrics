@@ -13,7 +13,7 @@
     {% else %}
       <div class="card">
         <div class="card-body">
-          <form method="post" action="{{ url_for('set_password') }}">
+          <form method="post" action="{{ v2_url('set_password') }}">
             <label for="master_password" class="form-label">Provide Master Password</label>
             <div class="input-group">
               <input type="password" id="master_password" name="master_password" class="form-control" required>

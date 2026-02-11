@@ -1,0 +1,27 @@
+{% extends 'viewer_base.html' %}
+{% block content %}
+<div class="row justify-content-center mt-5">
+  <div class="col-md-8">
+    <h2 class="mb-3">LRmetrics Bundle Viewer</h2>
+    <p class="text-muted">
+      Upload an LRmetrics export zip to visualize its dashboard data.
+    </p>
+    <div class="card">
+      <div class="card-body">
+        <form method="post" action="{{ url_for('load_bundle') }}" enctype="multipart/form-data">
+          <div class="mb-3">
+            <label for="bundle" class="form-label">Export bundle (.zip)</label>
+            <input id="bundle" name="bundle" type="file" accept=".zip,application/zip" class="form-control" required>
+          </div>
+          <div class="d-flex gap-2">
+            <button class="btn btn-primary" type="submit">Load Bundle</button>
+            {% if loaded %}
+              <a class="btn btn-outline-secondary" href="{{ url_for('display') }}">Open Current Dashboard</a>
+            {% endif %}
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

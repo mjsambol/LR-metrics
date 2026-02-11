@@ -3,11 +3,15 @@ import json
 import hashlib
 import zipfile
 import io
+import threading
+import traceback
+import uuid
 from datetime import datetime
 
 from flask import (
     Flask, render_template, request, redirect, url_for, flash, send_file, jsonify
 )
+import logging
 import requests
 from requests.auth import HTTPBasicAuth
 from base64 import urlsafe_b64encode, urlsafe_b64decode
@@ -17,10 +21,74 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET', 'dev-secret')
 
+# Basic debug logging to stdout
+logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'INFO'))
+app.logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+app.logger.info('LRmetrics starting up')
+
 DATA_DIR = os.environ.get('DATA_DIR', '/data')
 os.makedirs(DATA_DIR, exist_ok=True)
 CONFIG_PATH = os.path.join(DATA_DIR, 'servers.json')
 PROGRESS_PATH = os.path.join(DATA_DIR, 'progress.json')
+MASTER_PASSWORD_PATH = os.path.join(DATA_DIR, 'master_password.json')
+JOBS_DIR = os.path.join(DATA_DIR, 'jobs')
+ACTIVE_RETRIEVAL_PATH = os.path.join(DATA_DIR, 'active_retrieval_job')
+os.makedirs(JOBS_DIR, exist_ok=True)
+
+
+def _is_v2_request() -> bool:
+    # v2 is now the default interface.
+    v1_val = (request.args.get('v1') or '').strip().lower()
+    if v1_val in ('1', 'true', 'yes', 'on'):
+        return False
+    val = (request.args.get('v2') or '').strip().lower()
+    if val in ('0', 'false', 'no', 'off'):
+        return False
+    return True
+
+
+def _with_v2_param(url: str) -> str:
+    if not url or not url.startswith('/'):
+        return url
+    if 'v2=' in url:
+        return url
+    # Only preserve query param in explicit legacy mode.
+    if _is_v2_request():
+        return url
+    sep = '&' if '?' in url else '?'
+    return f"{url}{sep}v2=0"
+
+
+@app.context_processor
+def inject_v2_helpers():
+    def v2_url(endpoint: str, **kwargs):
+        return _with_v2_param(url_for(endpoint, **kwargs))
+
+    def v2_path(path: str):
+        return _with_v2_param(path)
+
+    return {
+        'is_v2': _is_v2_request(),
+        'v2_mode_qs': ('' if _is_v2_request() else '?v2=0'),
+        'v2_url': v2_url,
+        'v2_path': v2_path,
+    }
+
+
+@app.after_request
+def preserve_v2_on_redirects(response):
+    # Keep v2 mode sticky during POST/redirect flows.
+    try:
+        if not _is_v2_request():
+            return response
+        if response.status_code in (301, 302, 303, 307, 308):
+            loc = response.headers.get('Location') or ''
+            if loc.startswith('/'):
+                response.headers['Location'] = _with_v2_param(loc)
+    except Exception:
+        pass
+    return response
+
 @app.before_request
 def require_master_password():
     # Allow unauthenticated access only to landing page, password set, logout, and static assets
@@ -32,6 +100,7 @@ def require_master_password():
     if request.path in allowed_paths:
         return None
     if not session.get('LR_PWD'):
+        app.logger.debug('Master password missing; redirecting from %s', request.path)
         flash('Please set the master password before using the app.', 'danger')
         return redirect(url_for('index'))
 
@@ -42,6 +111,36 @@ from flask import session
 def _key_bytes():
     pwd = session.get('LR_PWD') or ''
     return hashlib.sha256(pwd.encode()).digest()
+
+def _master_hash(password: str, salt_hex: str) -> str:
+    raw = bytes.fromhex(salt_hex) + (password or '').encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()
+
+def _load_master_verifier():
+    if not os.path.exists(MASTER_PASSWORD_PATH):
+        return {}
+    try:
+        with open(MASTER_PASSWORD_PATH, 'r') as f:
+            data = json.load(f) or {}
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        app.logger.exception('Failed reading master password verifier')
+    return {}
+
+def _store_master_verifier(password: str):
+    salt_hex = os.urandom(16).hex()
+    payload = {'salt': salt_hex, 'hash': _master_hash(password, salt_hex)}
+    with open(MASTER_PASSWORD_PATH, 'w') as f:
+        json.dump(payload, f)
+
+def _verify_master_password(password: str) -> bool:
+    rec = _load_master_verifier()
+    salt_hex = rec.get('salt') if isinstance(rec, dict) else None
+    expected = rec.get('hash') if isinstance(rec, dict) else None
+    if not (isinstance(salt_hex, str) and isinstance(expected, str) and salt_hex and expected):
+        return False
+    return _master_hash(password, salt_hex) == expected
 
 def encrypt_password(plain: str) -> str:
     if plain is None:
@@ -69,28 +168,71 @@ def decrypt_password(stored: str) -> str:
             return ''
     return stored
 
+def _is_encrypted_unreadable(stored: str) -> bool:
+    if not (isinstance(stored, str) and stored.startswith('x:')):
+        return False
+    if stored == 'x:':
+        return False
+    try:
+        return decrypt_password(stored) == ''
+    except Exception:
+        return True
+
+def _master_password_warning() -> str:
+    # Non-blocking signal used by Setup/Retrieval pages.
+    # Session remains valid even when stored credentials cannot be decrypted.
+    if not session.get('LR_PWD'):
+        return ''
+    cfg = load_config()
+    bad_lr = 0
+    bad_gh = 0
+    for s in (cfg.get('lightrun') or []):
+        if _is_encrypted_unreadable(s.get('password') or ''):
+            bad_lr += 1
+    for r in (cfg.get('github') or []):
+        if _is_encrypted_unreadable(r.get('token') or ''):
+            bad_gh += 1
+    if not (bad_lr or bad_gh):
+        return ''
+    parts = []
+    if bad_lr:
+        parts.append(f"{bad_lr} Lightrun credential set(s)")
+    if bad_gh:
+        parts.append(f"{bad_gh} GitHub token(s)")
+    counts = ' and '.join(parts)
+    return (
+        f"Current master password cannot decrypt {counts}. "
+        "Use the original master password, or re-enter credentials in Setup."
+    )
+
 
 def load_config():
     # config is a dict of source_type -> list of servers
     if not os.path.exists(CONFIG_PATH):
+        app.logger.warning('Config file not found at %s', CONFIG_PATH)
         return {}
     with open(CONFIG_PATH, 'r') as f:
         try:
             c = json.load(f)
         except Exception:
+            app.logger.exception('Failed to parse config file %s', CONFIG_PATH)
             return {}
     # do not perform format migrations; expect dict format
+    app.logger.debug('Loaded config with keys: %s', list(c.keys()))
     return c
 
 
 def save_config(config):
     with open(CONFIG_PATH, 'w') as f:
         json.dump(config, f, indent=2)
+    app.logger.info('Config saved to %s; keys=%s', CONFIG_PATH, list(config.keys()))
 
 
 def get_servers_for(src_type):
     config = load_config()
-    return config.get(src_type, [])
+    servers = config.get(src_type, [])
+    app.logger.debug('get_servers_for(%s): count=%d', src_type, len(servers))
+    return servers
 
 
 def set_servers_for(src_type, servers):
@@ -104,6 +246,7 @@ def set_servers_for(src_type, servers):
     config = load_config()
     config[src_type] = cleaned
     save_config(config)
+    app.logger.info('set_servers_for(%s): saved %d servers', src_type, len(cleaned))
 
 
 def slugify(name: str) -> str:
@@ -382,6 +525,28 @@ def build_and_store_correlations_summary():
             json.dump(out, f, indent=2)
     except Exception:
         pass
+
+def load_correlations_summary(selected_server: str = None, week_whitelist=None) -> list:
+    # Read precomputed correlations from summaries/correlations.json so Display
+    # can be reproduced without raw git/audits datasets.
+    path = os.path.join(SUMMARIES_DIR, 'correlations.json')
+    try:
+        with open(path, 'r') as f:
+            payload = json.load(f) or {}
+    except Exception:
+        return []
+    weeks_map = payload.get('weeks') or {}
+    week_set = set(week_whitelist or [])
+    out = []
+    for wk, arr in weeks_map.items():
+        if week_set and wk not in week_set:
+            continue
+        for item in (arr or []):
+            if selected_server and item.get('server') != selected_server:
+                continue
+            out.append(item)
+    out.sort(key=lambda x: x.get('date', ''), reverse=True)
+    return out
 # Usage summary paths
 SUMMARIES_DIR = os.path.join(DATA_DIR, 'summaries')
 USAGE_SUMMARY_PATH = os.path.join(SUMMARIES_DIR, 'usage_summary.json')
@@ -598,7 +763,14 @@ def fetch_audits_for_server(server: dict, from_date: str, to_date: str, auth_coo
                 batch += 1
         if progress_cb:
             try:
-                _write_progress('lightrun', current=f"{server.get('name') or server.get('id')} · page {page}", completed=[], total=PAGE_SIZE)
+                state = _read_progress_combined()
+                lr_state = state.get('lightrun') or {}
+                _write_progress(
+                    'lightrun',
+                    current=f"{server.get('name') or server.get('id')} · page {page}",
+                    completed=lr_state.get('completed') or [],
+                    total=lr_state.get('total') or 0,
+                )
             except Exception:
                 pass
         print(f"[LRmetrics][audits] Collected {batch} entries on page {page} (total so far {len(entries)}).")
@@ -822,6 +994,110 @@ def _clear_progress():
     except Exception:
         pass
 
+def _job_path(job_id: str) -> str:
+    return os.path.join(JOBS_DIR, f"{job_id}.json")
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+def _write_json_atomic(path: str, payload):
+    tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    with open(tmp, 'w') as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+
+def _read_job(job_id: str):
+    if not job_id:
+        return None
+    path = _job_path(job_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _write_job(job_id: str, payload):
+    _write_json_atomic(_job_path(job_id), payload)
+
+def _update_job(job_id: str, **fields):
+    cur = _read_job(job_id) or {'job_id': job_id}
+    cur.update(fields)
+    _write_job(job_id, cur)
+
+def _read_active_job_id():
+    if not os.path.exists(ACTIVE_RETRIEVAL_PATH):
+        return ''
+    try:
+        with open(ACTIVE_RETRIEVAL_PATH, 'r') as f:
+            return (f.read() or '').strip()
+    except Exception:
+        return ''
+
+def _acquire_active_job(job_id: str):
+    try:
+        fd = os.open(ACTIVE_RETRIEVAL_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(fd, job_id.encode('utf-8'))
+        finally:
+            os.close(fd)
+        return True, ''
+    except FileExistsError:
+        existing = _read_active_job_id()
+        existing_job = _read_job(existing) if existing else None
+        if existing_job and existing_job.get('state') in ('completed', 'failed'):
+            _release_active_job(existing)
+            try:
+                fd = os.open(ACTIVE_RETRIEVAL_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    os.write(fd, job_id.encode('utf-8'))
+                finally:
+                    os.close(fd)
+                return True, ''
+            except Exception:
+                pass
+        return False, existing
+
+def _release_active_job(job_id: str):
+    try:
+        current = _read_active_job_id()
+        if current == job_id and os.path.exists(ACTIVE_RETRIEVAL_PATH):
+            os.remove(ACTIVE_RETRIEVAL_PATH)
+    except Exception:
+        pass
+
+def _read_progress_combined():
+    try:
+        if not os.path.exists(PROGRESS_PATH):
+            return {}
+        with open(PROGRESS_PATH, 'r') as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+def _progress_snapshot():
+    all_state = _read_progress_combined()
+    lr = all_state.get('lightrun') or {}
+    gh = all_state.get('github') or {}
+    completed_sum = len(lr.get('completed') or []) + len(gh.get('completed') or [])
+    current_name = ''
+    phase_label = ''
+    if lr.get('current'):
+        current_name = lr.get('current')
+        phase_label = 'Lightrun'
+    elif gh.get('current'):
+        current_name = gh.get('current')
+        phase_label = 'GitHub'
+    total = lr.get('total') or gh.get('total') or 0
+    return {
+        'total': total,
+        'completed': completed_sum,
+        'current': current_name,
+        'phase': phase_label,
+        'raw': all_state,
+    }
+
 @app.route('/progress')
 def progress_all():
     # Return combined progress for all sources
@@ -852,17 +1128,7 @@ def progress(source):
 def index():
     last = get_last_retrieved_timestamp()
     has_pwd = bool(session.get('LR_PWD'))
-    # Validate password by attempting to decrypt one stored password if present
-    if has_pwd:
-        cfg = load_config()
-        for servers in cfg.values():
-            for s in servers:
-                sp = s.get('password')
-                if isinstance(sp, str) and sp.startswith('x:'):
-                    val = decrypt_password(sp)
-                    if val == '':
-                        has_pwd = False
-                    break
+    app.logger.debug('Index: has_pwd=%s last=%s', has_pwd, last)
     return render_template('index.html', last_retrieved=last, has_pwd=has_pwd)
 
 
@@ -872,9 +1138,19 @@ def set_password():
     if not pwd:
         flash('Please enter a password', 'danger')
         return redirect(url_for('index'))
+    verifier = _load_master_verifier()
+    if verifier:
+        if not _verify_master_password(pwd):
+            session.pop('LR_PWD', None)
+            flash('Incorrect master password. Use the original password for this data set.', 'danger')
+            return redirect(url_for('index'))
+    else:
+        # First initialization for this DATA_DIR. This locks future sessions to the same password.
+        _store_master_verifier(pwd)
+        app.logger.info('Master password verifier initialized at %s', MASTER_PASSWORD_PATH)
     session['LR_PWD'] = pwd
     flash('Password set', 'success')
-    return redirect(url_for('index'))
+    return redirect(url_for('display'))
 
 
 @app.route('/logout')
@@ -888,7 +1164,9 @@ def logout():
 def setup():
     src = request.args.get('src', 'lightrun')
     servers = get_servers_for(src)
+    app.logger.debug('Setup GET: src=%s servers_count=%d', src, len(servers))
     if request.method == 'POST':
+        app.logger.debug('Setup POST: src=%s form_keys=%s', src, list(request.form.keys()))
         if not session.get('LR_PWD'):
             flash('Set the master password on the home page before saving.', 'danger')
             return redirect(url_for('setup', src=src))
@@ -941,6 +1219,7 @@ def setup():
                 flash('Name and Repository (owner/repo) are required', 'danger')
                 return redirect(url_for('setup', src=src))
             ok, status, info = gh_repo_exists(full_name, token, api_base or None)
+            app.logger.debug('GitHub repo_exists: ok=%s status=%s info_keys=%s', ok, status, (list(info.keys()) if isinstance(info, dict) else 'text'))
             if not ok:
                 snippet = ''
                 try:
@@ -960,7 +1239,7 @@ def setup():
         else:
             flash(f'Source {src} is not supported yet.', 'warning')
             return redirect(url_for('setup', src=src))
-    return render_template('setup.html', src=src, servers=servers)
+    return render_template('setup.html', src=src, servers=servers, master_password_warning=_master_password_warning())
 
 
 @app.route('/setup/test/<src>/<server_id>')
@@ -1094,7 +1373,7 @@ def setup_edit(src, server_id):
         flash('Server updated', 'success')
         return redirect(url_for('setup', src=src))
     # render edit form (password not populated)
-    return render_template('setup_edit.html', src=src, server=s)
+    return render_template('setup_edit.html', src=src, server=s, master_password_warning=_master_password_warning())
 
 
 @app.route('/setup/delete/<src>/<server_id>', methods=['POST'])
@@ -1155,38 +1434,57 @@ def upload_git_cli_txt():
     return redirect(url_for('retrieve'))
 
 
-@app.route('/retrieve', methods=['GET', 'POST'])
-def retrieve():
-    servers = get_servers_for('lightrun')
-    repos = get_servers_for('github')
+def _collect_retrieve_page_data(servers, repos):
+    bundles = {}
+    bundle_labels = {}
+    root = os.path.join(DATA_DIR, 'diagnostics_bundles')
+    for s in servers:
+        sid = s['id']
+        bundle_labels[sid] = s.get('name') or sid
+        sdir = os.path.join(root, sid)
+        files = []
+        if os.path.exists(sdir):
+            files = sorted(os.listdir(sdir), reverse=True)
+        bundles[sid] = files
+
+    gh_reports = {}
+    gh_labels = {}
+    gh_root = os.path.join(DATA_DIR, 'github_reports')
+    cli_root = os.path.join(GIT_CLI_DIR)
+    for r in repos:
+        rid = r['id']
+        gh_labels[rid] = r.get('name') or (r.get('full_name') or rid)
+        rdir = os.path.join(gh_root, rid)
+        cdir = os.path.join(cli_root, rid)
+        files = []
+        if os.path.exists(rdir):
+            files = sorted([f for f in os.listdir(rdir) if f.endswith('.json')], reverse=True)
+        cli_files = []
+        if os.path.exists(cdir):
+            cli_files = sorted([f for f in os.listdir(cdir) if f.endswith('.json')], reverse=True)
+        gh_reports[rid] = {'api': files, 'cli': cli_files}
+
+    return bundles, bundle_labels, gh_reports, gh_labels
+
+def _run_retrieval_job(job_id: str, servers, repos, server_passwords, repo_tokens):
     results = []
     github_results = []
-    if request.method == 'POST':
-        if not session.get('LR_PWD'):
-            flash('Set the master password on the home page before retrieval.', 'danger')
-            return redirect(url_for('retrieve'))
-        failures = 0
-        github_failures = 0
-        total_overall = len(servers) + len(repos)
-        completed_ids = []
-        _write_progress('lightrun', current='', completed=[], total=total_overall)
+    failures = 0
+    github_failures = 0
+    total_overall = len(servers) + len(repos)
+    completed_ids = []
+    _write_progress('lightrun', current='', completed=[], total=total_overall)
+    try:
         for s in servers:
             try:
+                app.logger.debug('Retrieving for server id=%s name=%s url=%s', s.get('id'), s.get('name'), s.get('url'))
                 base = s['url'].rstrip('/')
                 email = s.get('email', '')
-                stored = s.get('password') or ''
-                if isinstance(stored, str) and stored.startswith('x:'):
-                    pwd = decrypt_password(stored)
-                    if pwd == '':
-                        flash('Master password is invalid. Please set it again on the home page.', 'danger')
-                        return redirect(url_for('index'))
-                else:
-                    pwd = stored or ''
-                # mark current
-                _write_progress('lightrun', current=(s.get('name') or s.get('id')), completed=completed_ids, total=len(servers))
-                # authenticate to get cookie
+                pwd = server_passwords.get(s.get('id'), '') or ''
+                _write_progress('lightrun', current=(s.get('name') or s.get('id')), completed=completed_ids, total=total_overall)
                 auth = lr_authenticate(base, email, pwd, timeout=15, verify=False)
                 if not auth.get('ok'):
+                    app.logger.warning('Auth failed for server %s: %s', s.get('id'), auth)
                     diag = auth.get('diag') or {}
                     detail_body = diag.get('body')
                     if not isinstance(detail_body, str):
@@ -1201,74 +1499,70 @@ def retrieve():
                     _write_progress('lightrun', current='', completed=completed_ids, total=total_overall)
                     continue
                 auth_cookie = auth.get('cookie') or {}
-                # prepare diagnostics via API helper
-                body = lr_diag_body(s.get('name','server'))
+                body = lr_diag_body(s.get('name', 'server'))
                 ok, st_code, reason = lr_start_diagnostics(base, auth_cookie, body, timeout=20, verify=False)
                 if not ok:
+                    app.logger.warning('Diagnostics start failed for %s status=%s reason=%s', s.get('id'), st_code, reason)
                     failures += 1
                     results.append({'server': s.get('id'), 'error': "Diagnostics start failed", 'status': st_code, 'reason': reason})
                     completed_ids.append(s.get('name') or s.get('id'))
                     _write_progress('lightrun', current='', completed=completed_ids, total=total_overall)
                     continue
-                # poll status until COMPLETED
-                status_info = lr_poll_status(base, auth_cookie, timeout=20, verify=False, max_iters=120)
-                # if completed, download the bundle
+                status_info = lr_poll_status(base, auth_cookie, timeout=20, verify=False, max_iters=120, max_wait_seconds=600)
+                app.logger.debug('Diagnostics status for %s: %s', s.get('id'), status_info)
                 if status_info.get('status') == 'COMPLETED':
                     dl_status, dl_headers, dl_content = lr_download(base, auth_cookie, timeout=60, verify=False)
+                    app.logger.debug('Download status=%s content-type=%s', dl_status, dl_headers.get('Content-Type'))
                     ctype = (dl_headers.get('Content-Type') or '').lower()
                     if dl_status == 200:
-                        # Save regardless of content-type; browsers download zip immediately even without correct header
                         path = store_diagnostics_zip(s, dl_content)
                         results.append({'server': s.get('id'), 'diagnostics': 'COMPLETED', 'bundle': path, 'content_type': ctype})
                     else:
                         failures += 1
                         results.append({'server': s.get('id'), 'diagnostics': 'COMPLETED', 'error': "Download failed", 'status': dl_status})
                 else:
-                    # status failure or timeout
                     failures += 1
                     results.append({'server': s.get('id'), 'diagnostics': 'started', 'status': status_info})
-                # Fetch audits for the last 13 weeks window
                 try:
                     from datetime import timedelta
-                    # Anchor window to current Monday (start of week)
                     today = datetime.utcnow().date()
                     monday = today - timedelta(days=today.weekday())
                     to_date = monday.strftime('%Y-%m-%d')
                     from_date = (monday - timedelta(weeks=13)).strftime('%Y-%m-%d')
-                    # Progress will show "Server · page N" as pages advance
                     audits_payload = fetch_audits_for_server(s, from_date, to_date, auth_cookie, progress_cb=True)
                     if isinstance(audits_payload, dict):
                         store_audits(s, audits_payload)
+                        app.logger.info('Stored audits for %s entries=%d', s.get('id'), len(audits_payload.get('entries') or []))
                 except Exception as ae:
+                    app.logger.exception('Audits fetch failed for %s', s.get('id'))
                     results.append({'server': s.get('id'), 'audits_error': str(ae)})
             except Exception as e:
                 results.append({'server': s.get('id'), 'error': str(e)})
                 failures += 1
-            # mark completion of this server
             completed_ids.append(s.get('name') or s.get('id'))
             _write_progress('lightrun', current='', completed=completed_ids, total=total_overall)
-        # After audits fetched for all servers, rebuild audits summary
+
         try:
             build_audits_summary()
         except Exception:
             pass
-        # Process GitHub repos as part of unified retrieval
+
         completed_repos = []
         _write_progress('github', current='', completed=[], total=total_overall)
         from datetime import timedelta
         now = datetime.utcnow()
         since_default = (now - timedelta(days=30)).isoformat(timespec='seconds') + 'Z'
         for r in repos:
+            full_name = r.get('full_name') or ''
             try:
-                token_stored = r.get('token') or ''
-                token = decrypt_password(token_stored) if token_stored else ''
-                full_name = r.get('full_name') or ''
+                app.logger.debug('GitHub repo retrieval id=%s name=%s full=%s', r.get('id'), r.get('name'), full_name)
+                token = repo_tokens.get(r.get('id'), '') or ''
                 api_base = (r.get('api_base') or '').strip() or None
-                # Determine since based on latest stored report timestamp if present; otherwise 30-day default
                 latest_generated_at = gh_latest_generated_at(r.get('id'), DATA_DIR)
                 since = latest_generated_at or r.get('last_checked') or since_default
                 _write_progress('github', current=(r.get('name') or full_name), completed=completed_repos, total=total_overall)
                 commits = gh_list_commits(full_name, token, since_iso=since, until_iso=now.isoformat(timespec='seconds') + 'Z', api_base=api_base)
+                app.logger.info('Fetched %d commits for %s since=%s', len(commits), full_name, since)
                 repo_changes = []
                 for c in commits[:200]:
                     sha = c.get('sha')
@@ -1280,78 +1574,167 @@ def retrieve():
                         continue
                     files = [f.get('filename') for f in (body.get('files') or []) if isinstance(f, dict) and f.get('filename')]
                     repo_changes.append({'commit': sha, 'date': date, 'user': author_login or author_name or 'unknown', 'files': files})
-                # assemble report and store to filesystem
                 report = {'repo': r.get('name') or full_name, 'full_name': full_name, 'generated_at': now.isoformat(timespec='seconds') + 'Z', 'changes': repo_changes}
                 github_results.append(report)
                 gh_store_report(r, json.dumps(report), DATA_DIR)
+                app.logger.info('Stored GitHub report for %s changes=%d', full_name, len(repo_changes))
                 r['last_checked'] = now.isoformat(timespec='seconds') + 'Z'
             except Exception as e:
+                app.logger.exception('GitHub retrieval failed for %s', r.get('full_name'))
                 github_results.append({'repo': r.get('name') or r.get('full_name'), 'error': str(e)})
                 github_failures += 1
             completed_repos.append(r.get('name') or full_name)
             _write_progress('github', current='', completed=completed_repos, total=total_overall)
+
         set_servers_for('github', repos)
-        # After audits and git reports are in place, persist correlations summary
         try:
             ensure_audits_summary_fresh()
             build_and_store_correlations_summary()
         except Exception:
             pass
 
-        if failures or github_failures:
-            flash('Communication with some servers failed. Check the Debug details below.', 'danger')
-        else:
-            flash('Retrieval finished', 'success')
+        _update_job(
+            job_id,
+            state='completed',
+            finished_at=_utc_now_iso(),
+            failures=failures,
+            github_failures=github_failures,
+            had_errors=bool(failures or github_failures),
+            results=results,
+            github_results=github_results,
+            error='',
+        )
+    except Exception as e:
+        app.logger.exception('Retrieval job %s failed with an unexpected error', job_id)
+        _update_job(
+            job_id,
+            state='failed',
+            finished_at=_utc_now_iso(),
+            failures=failures,
+            github_failures=github_failures,
+            had_errors=True,
+            results=results,
+            github_results=github_results,
+            error=str(e),
+            traceback=traceback.format_exc(),
+        )
+    finally:
         _clear_progress()
-        try:
-            print("[LRmetrics] Retrieval results:")
-            for r in results:
-                try:
-                    print(json.dumps(r, indent=2))
-                except Exception:
-                    print(str(r))
-            print("[LRmetrics] GitHub Retrieval results:")
-            for r in github_results:
-                try:
-                    print(json.dumps(r, indent=2))
-                except Exception:
-                    print(str(r))
-        except Exception:
-            pass
-    # list latest diagnostics bundles for display
-    bundles = {}
-    bundle_labels = {}
-    root = os.path.join(DATA_DIR, 'diagnostics_bundles')
-    for s in servers:
-        sid = s['id']
-        bundle_labels[sid] = s.get('name') or sid
-        sdir = os.path.join(root, sid)
-        files = []
-        if os.path.exists(sdir):
-            files = sorted(os.listdir(sdir), reverse=True)
-        bundles[sid] = files
+        _release_active_job(job_id)
 
-    # list latest github reports for display
-    gh_reports = {}
-    gh_labels = {}
-    gh_root = os.path.join(DATA_DIR, 'github_reports')
-    cli_root = os.path.join(GIT_CLI_DIR)
-    for r in repos:
-        rid = r['id']
-        gh_labels[rid] = r.get('name') or (r.get('full_name') or rid)
-        rdir = os.path.join(gh_root, rid)
-        cdir = os.path.join(cli_root, rid)
-        files = []
-        if os.path.exists(rdir):
-            files = sorted([f for f in os.listdir(rdir) if f.endswith('.json')], reverse=True)
-        # Append CLI-uploaded JSON files to the list for visibility
-        cli_files = []
-        if os.path.exists(cdir):
-            cli_files = sorted([f for f in os.listdir(cdir) if f.endswith('.json')], reverse=True)
-        gh_reports[rid] = {'api': files, 'cli': cli_files}
+@app.route('/retrieve/start', methods=['POST'])
+def retrieve_start():
+    if not session.get('LR_PWD'):
+        return jsonify({'ok': False, 'error': 'Master password is not set'}), 400
 
+    servers = get_servers_for('lightrun')
+    repos = get_servers_for('github')
     total_overall = len(servers) + len(repos)
-    # Ensure summaries exist when visiting retrieval without running a fetch
+    if total_overall == 0:
+        return jsonify({'ok': False, 'error': 'No servers or repos configured'}), 400
+
+    server_passwords = {}
+    for s in servers:
+        sid = s.get('id')
+        stored = s.get('password') or ''
+        if isinstance(stored, str) and stored.startswith('x:'):
+            pwd = decrypt_password(stored)
+            if pwd == '':
+                return jsonify({'ok': False, 'error': 'Master password is invalid. Please set it again on the home page.'}), 400
+        else:
+            pwd = stored or ''
+        server_passwords[sid] = pwd
+
+    repo_tokens = {}
+    for r in repos:
+        rid = r.get('id')
+        token_stored = r.get('token') or ''
+        token = decrypt_password(token_stored) if token_stored else ''
+        repo_tokens[rid] = token
+
+    job_id = uuid.uuid4().hex
+    acquired, active_job_id = _acquire_active_job(job_id)
+    if not acquired:
+        return jsonify({'ok': False, 'error': 'A retrieval job is already running', 'job_id': active_job_id}), 409
+
+    _clear_progress()
+    _write_progress('lightrun', current='', completed=[], total=total_overall)
+    _write_progress('github', current='', completed=[], total=total_overall)
+    _write_job(job_id, {
+        'job_id': job_id,
+        'state': 'running',
+        'created_at': _utc_now_iso(),
+        'started_at': _utc_now_iso(),
+        'finished_at': '',
+        'total_overall': total_overall,
+        'failures': 0,
+        'github_failures': 0,
+        'had_errors': False,
+        'results': [],
+        'github_results': [],
+        'error': '',
+    })
+
+    t = threading.Thread(
+        target=_run_retrieval_job,
+        args=(job_id, servers, repos, server_passwords, repo_tokens),
+        daemon=True,
+        name=f"retrieve-{job_id[:8]}",
+    )
+    t.start()
+    return jsonify({'ok': True, 'job_id': job_id, 'status_url': url_for('retrieve_status', job_id=job_id)}), 202
+
+@app.route('/retrieve/status/<job_id>')
+def retrieve_status(job_id):
+    job = _read_job(job_id)
+    if not job:
+        return jsonify({'ok': False, 'error': 'job not found'}), 404
+    snap = _progress_snapshot()
+    active_job_id = _read_active_job_id()
+    return jsonify({
+        'ok': True,
+        'job_id': job_id,
+        'state': job.get('state'),
+        'created_at': job.get('created_at'),
+        'started_at': job.get('started_at'),
+        'finished_at': job.get('finished_at'),
+        'had_errors': bool(job.get('had_errors')),
+        'failures': int(job.get('failures') or 0),
+        'github_failures': int(job.get('github_failures') or 0),
+        'error': job.get('error') or '',
+        'progress': snap,
+        'active': active_job_id == job_id,
+    }), 200
+
+@app.route('/retrieve', methods=['GET'])
+def retrieve():
+    servers = get_servers_for('lightrun')
+    repos = get_servers_for('github')
+    app.logger.info('Retrieve %s: servers=%d repos=%d method=%s', request.path, len(servers), len(repos), request.method)
+
+    results = []
+    github_results = []
+    job_id = (request.args.get('job_id') or '').strip()
+    notify = (request.args.get('notify') or '').strip() == '1'
+    if job_id:
+        job = _read_job(job_id)
+        if job:
+            results = job.get('results') or []
+            github_results = job.get('github_results') or []
+            if notify:
+                if job.get('state') == 'completed' and not job.get('had_errors'):
+                    flash('Retrieval finished', 'success')
+                elif job.get('state') == 'completed':
+                    flash('Communication with some servers failed. Check the Debug details below.', 'danger')
+                elif job.get('state') == 'failed':
+                    flash(f"Retrieval failed: {job.get('error') or 'unknown error'}", 'danger')
+        elif notify:
+            flash('Retrieval job was not found', 'warning')
+
+    bundles, bundle_labels, gh_reports, gh_labels = _collect_retrieve_page_data(servers, repos)
+    total_overall = len(servers) + len(repos)
+    active_job_id = _read_active_job_id()
+
     try:
         ensure_usage_summary_fresh()
     except Exception:
@@ -1360,7 +1743,19 @@ def retrieve():
         ensure_audits_summary_fresh()
     except Exception:
         pass
-    return render_template('retrieval.html', servers=servers, results=results, bundles=bundles, bundle_labels=bundle_labels, github_results=github_results, gh_reports=gh_reports, gh_labels=gh_labels, total_overall=total_overall)
+    return render_template(
+        'retrieval.html',
+        servers=servers,
+        results=results,
+        bundles=bundles,
+        bundle_labels=bundle_labels,
+        github_results=github_results,
+        gh_reports=gh_reports,
+        gh_labels=gh_labels,
+        total_overall=total_overall,
+        active_job_id=active_job_id,
+        master_password_warning=_master_password_warning(),
+    )
 
 
 @app.route('/display')
@@ -1424,9 +1819,17 @@ def display():
         for u, cnt in (wentry.get('usersCounts') or {}).items():
             user_counts[u] = user_counts.get(u, 0) + cnt
     top_users = sorted(([{'user': u, 'total': c} for u, c in user_counts.items() if c > 0]), key=lambda x: x['total'], reverse=True)
-    # Build correlations for the currently selected server (or all)
+    # Build correlations from persisted summary, so exported bundles can
+    # reproduce Display without raw git/audits data.
     corr_weeks = audits_weeks if (server_id and server_id != 'all') else (audits_summary.get('weeks') or {})
-    correlations = build_correlations(corr_weeks)
+    correlations = load_correlations_summary(
+        selected_server=(server_id if (server_id and server_id != 'all') else None),
+        week_whitelist=(corr_weeks.keys() if isinstance(corr_weeks, dict) else []),
+    )
+    if not correlations:
+        # Backward-compatible fallback for environments that don't yet have
+        # summaries/correlations.json.
+        correlations = build_correlations(corr_weeks)
     total_corr = len(correlations)
     # Logging for troubleshooting timeline data
     try:
@@ -1506,23 +1909,33 @@ def serve_cli_report(repo_id, filename):
 
 @app.route('/export/bundles')
 def export_bundles():
-    # Create a zip containing diagnostics_bundles (all files) and summaries (all files)
+    # Create a zip containing diagnostics bundles and non-sensitive summaries.
+    # Summaries include precomputed correlations for Display reproducibility.
+    try:
+        ensure_usage_summary_fresh()
+    except Exception:
+        pass
+    try:
+        ensure_audits_summary_fresh()
+    except Exception:
+        pass
+    try:
+        build_and_store_correlations_summary()
+    except Exception:
+        pass
+
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
-        # diagnostics_bundles: include all files recursively
-        root = os.path.join(DATA_DIR, 'diagnostics_bundles')
-        if os.path.exists(root):
+        export_roots = [
+            os.path.join(DATA_DIR, 'diagnostics_bundles'),
+            SUMMARIES_DIR,
+        ]
+        for root in export_roots:
+            if not os.path.exists(root):
+                continue
             for dirpath, dirnames, filenames in os.walk(root):
                 for fn in filenames:
                     fp = os.path.join(dirpath, fn)
-                    # Arcname should be relative under diagnostics_bundles/
-                    rel = os.path.relpath(fp, DATA_DIR)
-                    z.write(fp, arcname=rel)
-        # summaries: include all files
-        if os.path.exists(SUMMARIES_DIR):
-            for fn in os.listdir(SUMMARIES_DIR):
-                fp = os.path.join(SUMMARIES_DIR, fn)
-                if os.path.isfile(fp):
                     rel = os.path.relpath(fp, DATA_DIR)
                     z.write(fp, arcname=rel)
     mem.seek(0)
