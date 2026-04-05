@@ -7,6 +7,7 @@ import threading
 import traceback
 import uuid
 from datetime import datetime
+from urllib.parse import urlparse
 
 from flask import (
     Flask, render_template, request, redirect, url_for, flash, send_file, jsonify
@@ -142,6 +143,100 @@ def _verify_master_password(password: str) -> bool:
         return False
     return _master_hash(password, salt_hex) == expected
 
+
+def _extract_host(raw_url: str) -> str:
+    u = (raw_url or '').strip()
+    if not u:
+        return ''
+    if '://' not in u:
+        u = 'https://' + u
+    try:
+        return (urlparse(u).hostname or '').strip().lower()
+    except Exception:
+        return ''
+
+
+def _lightrun_http_reachable(base_url: str):
+    """True if GET {base}/version returns HTTP 200 (same probe as Setup → Test)."""
+    try:
+        status, _text = get_version(base_url.rstrip('/'), timeout=10, verify=False)
+        if status == 200:
+            return True, ''
+        return False, f'GET /version returned HTTP {status}'
+    except requests.RequestException as e:
+        return False, str(e)
+
+
+def _github_api_reachable(api_base: str):
+    """True if an HTTP request to the GitHub API root completes without connection errors."""
+    base = (api_base or '').strip().rstrip('/') or 'https://api.github.com'
+    url = f'{base}/'
+    try:
+        requests.get(
+            url,
+            timeout=10,
+            headers={'Accept': 'application/vnd.github+json'},
+        )
+        return True, ''
+    except requests.RequestException as e:
+        return False, str(e)
+
+
+def _preflight_reachability(servers, repos):
+    failures = []
+    bad_lightrun_ids = set()
+    bad_repo_ids = set()
+    target_statuses = []
+    total_targets = 0
+    reachable_targets = 0
+
+    for s in servers:
+        sid = s.get('id') or s.get('name') or 'server'
+        url = (s.get('url') or '').strip()
+        host = _extract_host(url)
+        if not url or not host:
+            failures.append({'kind': 'lightrun', 'id': sid, 'host': host or '', 'reason': 'Missing or invalid URL'})
+            bad_lightrun_ids.add(sid)
+            target_statuses.append({'kind': 'lightrun', 'id': sid, 'host': host or '', 'ok': False, 'reason': 'Missing or invalid URL'})
+            continue
+        total_targets += 1
+        ok, reason = _lightrun_http_reachable(url)
+        if ok:
+            reachable_targets += 1
+            target_statuses.append({'kind': 'lightrun', 'id': sid, 'host': host, 'ok': True, 'reason': ''})
+        else:
+            failures.append({'kind': 'lightrun', 'id': sid, 'host': host, 'reason': reason})
+            bad_lightrun_ids.add(sid)
+            target_statuses.append({'kind': 'lightrun', 'id': sid, 'host': host, 'ok': False, 'reason': reason})
+
+    for r in repos:
+        rid = r.get('id') or r.get('name') or (r.get('full_name') or 'repo')
+        api_base = (r.get('api_base') or '').strip() or 'https://api.github.com'
+        host = _extract_host(api_base)
+        if not host:
+            failures.append({'kind': 'github', 'id': rid, 'host': '', 'reason': 'Missing or invalid API base URL'})
+            bad_repo_ids.add(rid)
+            target_statuses.append({'kind': 'github', 'id': rid, 'host': '', 'ok': False, 'reason': 'Missing or invalid API base URL'})
+            continue
+        total_targets += 1
+        ok, reason = _github_api_reachable(api_base)
+        if ok:
+            reachable_targets += 1
+            target_statuses.append({'kind': 'github', 'id': rid, 'host': host, 'ok': True, 'reason': ''})
+        else:
+            failures.append({'kind': 'github', 'id': rid, 'host': host, 'reason': reason})
+            bad_repo_ids.add(rid)
+            target_statuses.append({'kind': 'github', 'id': rid, 'host': host, 'ok': False, 'reason': reason})
+
+    return {
+        'total_targets': total_targets,
+        'reachable_targets': reachable_targets,
+        'target_statuses': target_statuses,
+        'failures': failures,
+        'bad_lightrun_ids': bad_lightrun_ids,
+        'bad_repo_ids': bad_repo_ids,
+    }
+
 def encrypt_password(plain: str) -> str:
     if plain is None:
         return ''
@@ -274,6 +369,7 @@ def server_id_from_name(name: str, existing_ids=None) -> str:
 
 from lightrun_api import (
     test_connection,
+    get_version,
     authenticate as lr_authenticate,
     start_diagnostics as lr_start_diagnostics,
     poll_diagnostics_status as lr_poll_status,
@@ -1181,7 +1277,8 @@ def setup():
                 return redirect(url_for('setup', src=src))
             existing_ids = [s.get('id') for s in servers]
             sid = server_id_from_name(name, existing_ids)
-            server = {'id': sid, 'name': name, 'url': url.rstrip('/'), 'email': email, 'password': password}
+            anonymize = request.form.get('anonymize_diagnostics') in ('on', 'true', '1', 'yes')
+            server = {'id': sid, 'name': name, 'url': url.rstrip('/'), 'email': email, 'password': password, 'anonymize_diagnostics': anonymize}
             # Test connectivity and auth
             ok, status, info = test_connection({'id': sid, 'name': name, 'url': url.rstrip('/'), 'email': email, 'password': password})
             if not ok:
@@ -1360,6 +1457,7 @@ def setup_edit(src, server_id):
         s['name'] = name
         s['url'] = url.rstrip('/')
         s['email'] = email
+        s['anonymize_diagnostics'] = request.form.get('anonymize_diagnostics') in ('on', 'true', '1', 'yes')
         if password:
             s['password'] = encrypt_password(password)
         # leave existing password if password field blank
@@ -1466,11 +1564,13 @@ def _collect_retrieve_page_data(servers, repos):
 
     return bundles, bundle_labels, gh_reports, gh_labels
 
-def _run_retrieval_job(job_id: str, servers, repos, server_passwords, repo_tokens):
+def _run_retrieval_job(job_id: str, servers, repos, server_passwords, repo_tokens, bad_lightrun_ids=None, bad_repo_ids=None):
     results = []
     github_results = []
     failures = 0
     github_failures = 0
+    bad_lightrun_ids = set(bad_lightrun_ids or [])
+    bad_repo_ids = set(bad_repo_ids or [])
     total_overall = len(servers) + len(repos)
     completed_ids = []
     _write_progress('lightrun', current='', completed=[], total=total_overall)
@@ -1478,6 +1578,17 @@ def _run_retrieval_job(job_id: str, servers, repos, server_passwords, repo_token
         for s in servers:
             try:
                 app.logger.debug('Retrieving for server id=%s name=%s url=%s', s.get('id'), s.get('name'), s.get('url'))
+                sid = s.get('id')
+                if sid in bad_lightrun_ids:
+                    failures += 1
+                    results.append({
+                        'server': sid,
+                        'error': 'Connectivity preflight failed',
+                        'reason': 'HTTP connectivity preflight failed from LRmetrics container',
+                    })
+                    completed_ids.append(s.get('name') or sid)
+                    _write_progress('lightrun', current='', completed=completed_ids, total=total_overall)
+                    continue
                 base = s['url'].rstrip('/')
                 email = s.get('email', '')
                 pwd = server_passwords.get(s.get('id'), '') or ''
@@ -1499,7 +1610,10 @@ def _run_retrieval_job(job_id: str, servers, repos, server_passwords, repo_token
                     _write_progress('lightrun', current='', completed=completed_ids, total=total_overall)
                     continue
                 auth_cookie = auth.get('cookie') or {}
-                body = lr_diag_body(s.get('name', 'server'))
+                body = lr_diag_body(
+                    s.get('name', 'server'),
+                    bool(s.get('anonymize_diagnostics')),
+                )
                 ok, st_code, reason = lr_start_diagnostics(base, auth_cookie, body, timeout=20, verify=False)
                 if not ok:
                     app.logger.warning('Diagnostics start failed for %s status=%s reason=%s', s.get('id'), st_code, reason)
@@ -1556,6 +1670,17 @@ def _run_retrieval_job(job_id: str, servers, repos, server_passwords, repo_token
             full_name = r.get('full_name') or ''
             try:
                 app.logger.debug('GitHub repo retrieval id=%s name=%s full=%s', r.get('id'), r.get('name'), full_name)
+                rid = r.get('id')
+                if rid in bad_repo_ids:
+                    github_failures += 1
+                    github_results.append({
+                        'repo': r.get('name') or full_name,
+                        'error': 'Connectivity preflight failed',
+                        'reason': 'GitHub API HTTP connectivity preflight failed from LRmetrics container',
+                    })
+                    completed_repos.append(r.get('name') or full_name)
+                    _write_progress('github', current='', completed=completed_repos, total=total_overall)
+                    continue
                 token = repo_tokens.get(r.get('id'), '') or ''
                 api_base = (r.get('api_base') or '').strip() or None
                 latest_generated_at = gh_latest_generated_at(r.get('id'), DATA_DIR)
@@ -1652,6 +1777,17 @@ def retrieve_start():
         token = decrypt_password(token_stored) if token_stored else ''
         repo_tokens[rid] = token
 
+    preflight = _preflight_reachability(servers, repos)
+    if preflight.get('total_targets', 0) > 0 and preflight.get('reachable_targets', 0) == 0:
+        failures = preflight.get('failures') or []
+        details = ', '.join(
+            [f"{f.get('kind')}:{f.get('id')} ({f.get('host') or 'invalid-host'})" for f in failures[:6]]
+        )
+        msg = 'No configured targets are reachable (HTTP check failed from LRmetrics container).'
+        if details:
+            msg = f"{msg} Affected: {details}"
+        return jsonify({'ok': False, 'error': msg}), 503
+
     job_id = uuid.uuid4().hex
     acquired, active_job_id = _acquire_active_job(job_id)
     if not acquired:
@@ -1677,7 +1813,15 @@ def retrieve_start():
 
     t = threading.Thread(
         target=_run_retrieval_job,
-        args=(job_id, servers, repos, server_passwords, repo_tokens),
+        args=(
+            job_id,
+            servers,
+            repos,
+            server_passwords,
+            repo_tokens,
+            list(preflight.get('bad_lightrun_ids') or []),
+            list(preflight.get('bad_repo_ids') or []),
+        ),
         daemon=True,
         name=f"retrieve-{job_id[:8]}",
     )
@@ -1704,6 +1848,35 @@ def retrieve_status(job_id):
         'error': job.get('error') or '',
         'progress': snap,
         'active': active_job_id == job_id,
+    }), 200
+
+
+@app.route('/connectivity-check')
+def connectivity_check():
+    servers = get_servers_for('lightrun')
+    repos = get_servers_for('github')
+    preflight = _preflight_reachability(servers, repos)
+    total = int(preflight.get('total_targets') or 0)
+    ok = int(preflight.get('reachable_targets') or 0)
+    if total == 0:
+        level = 'info'
+        message = 'No servers or repositories configured yet.'
+    elif ok == total:
+        level = 'success'
+        message = f'Connectivity check passed for all configured targets ({ok}/{total}).'
+    elif ok == 0:
+        level = 'danger'
+        message = 'Connectivity check failed for all configured targets (0 reachable).'
+    else:
+        level = 'warning'
+        message = f'Connectivity check is partial: {ok}/{total} targets are reachable.'
+    return jsonify({
+        'ok': ok == total and total > 0,
+        'level': level,
+        'message': message,
+        'total_targets': total,
+        'reachable_targets': ok,
+        'targets': preflight.get('target_statuses') or [],
     }), 200
 
 @app.route('/retrieve', methods=['GET'])

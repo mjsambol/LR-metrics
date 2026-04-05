@@ -116,7 +116,7 @@ def test_connection(server: Dict[str, Any]) -> Tuple[bool, Optional[int], Any]:
         return False, None, str(e)
 
 
-def diagnostics_request_body(server_name: str) -> Dict[str, Any]:
+def diagnostics_request_body(server_name: str, should_anonymize: bool = False) -> Dict[str, Any]:
     """Standard diagnostics request body used by the app."""
     return {
         "diagnostics": [
@@ -125,6 +125,6 @@ def diagnostics_request_body(server_name: str) -> Dict[str, Any]:
             "COMPANY_SETTINGS", "REPORT_CONFIG"
         ],
         "logCollectionSettings": {"useRandomClients": True},
-        "shouldAnonymize": False,
+        "shouldAnonymize": bool(should_anonymize),
         "reportDescription": f"{(server_name or 'server')} - {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
     }

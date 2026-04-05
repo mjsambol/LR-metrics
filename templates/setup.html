@@ -43,6 +43,10 @@
               <label class="form-label">Password</label>
               <input id="input-password" name="password" type="password" class="form-control">
             </div>
+            <div class="form-check mb-3">
+              <input class="form-check-input" type="checkbox" name="anonymize_diagnostics" id="input-anonymize" value="on">
+              <label class="form-check-label" for="input-anonymize">Anonymize diagnostics</label>
+            </div>
             <div class="d-flex gap-2">
               <button id="btn-add-test" type="button" class="btn btn-outline-secondary">Test</button>
               <button id="btn-add-save" class="btn btn-primary" disabled>Save</button>
@@ -67,6 +71,7 @@
                     {% if s.version %}
                       <div class="small text-muted">Version: {{ s.version }}</div>
                     {% endif %}
+                    <div class="small text-muted">Anonymize diagnostics: {{ 'on' if s.get('anonymize_diagnostics') else 'off' }}</div>
                   </div>
                 </li>
               {% endfor %}
@@ -170,6 +175,17 @@ function withV2(url){
   if(!V2_QS) return url;
   return url.includes('?') ? `${url}&v2=1` : `${url}${V2_QS}`;
 }
+function escapeHtmlText(s) {
+  if (s == null) return '';
+  const t = typeof s === 'object' ? JSON.stringify(s) : String(s);
+  return t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function testFailureMessage(j) {
+  let v = j.info;
+  if (v == null || v === '') v = j.status;
+  if (v == null || v === '') v = j.error;
+  return escapeHtmlText(v);
+}
 function selectedServerId(){
   const sel = document.querySelector('input[name="selected_server"]:checked');
   return sel ? sel.value : null;
@@ -226,7 +242,7 @@ document.addEventListener('DOMContentLoaded', function(){
         const j = await res.json();
         if(j.ok){
           let parts = [];
-          if(j.version) parts.push(`<small class="text-success ms-1">${j.version}</small>`);
+          if(j.version) parts.push(`<small class="text-success ms-1">${escapeHtmlText(j.version)}</small>`);
           if(j.auth){
             if(j.auth.ok) parts.push(`<span class="badge bg-success ms-2">Auth OK</span>`);
             else parts.push(`<span class="badge bg-warning ms-2">Auth Failed</span>`);
@@ -239,11 +255,11 @@ document.addEventListener('DOMContentLoaded', function(){
             document.getElementById('btn-add-save').disabled = true;
           }
         } else {
-          statusEl.innerHTML = `<span class="badge bg-danger">Fail</span> <small class="text-danger ms-1">${j.info || j.status || j.error || ''}</small>`;
+          statusEl.innerHTML = `<span class="badge bg-danger">Fail</span> <small class="text-danger ms-1">${testFailureMessage(j)}</small>`;
           document.getElementById('btn-add-save').disabled = true;
         }
       }catch(e){
-        statusEl.innerHTML = `<span class="badge bg-danger">Error</span> <small class="text-danger ms-1">${e}</small>`;
+        statusEl.innerHTML = `<span class="badge bg-danger">Error</span> <small class="text-danger ms-1">${escapeHtmlText(e && e.message ? e.message : e)}</small>`;
         document.getElementById('btn-add-save').disabled = true;
       }
     });
@@ -272,11 +288,11 @@ document.addEventListener('DOMContentLoaded', function(){
           statusEl.innerHTML = `<span class="badge bg-success">OK</span>`;
           document.getElementById('btn-gh-save').disabled = false;
         } else {
-          statusEl.innerHTML = `<span class="badge bg-danger">Fail</span> <small class="text-danger ms-1">${j.info || j.status || j.error || ''}</small>`;
+          statusEl.innerHTML = `<span class="badge bg-danger">Fail</span> <small class="text-danger ms-1">${testFailureMessage(j)}</small>`;
           document.getElementById('btn-gh-save').disabled = true;
         }
       }catch(e){
-        statusEl.innerHTML = `<span class="badge bg-danger">Error</span> <small class="text-danger ms-1">${e}</small>`;
+        statusEl.innerHTML = `<span class="badge bg-danger">Error</span> <small class="text-danger ms-1">${escapeHtmlText(e && e.message ? e.message : e)}</small>`;
         document.getElementById('btn-gh-save').disabled = true;
       }
     });

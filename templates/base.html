@@ -40,9 +40,11 @@
     <main class="container mt-4">
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
-          {% for category, msg in messages %}
-            <div class="alert alert-{{category}}">{{ msg }}</div>
-          {% endfor %}
+          <div id="lrPageFlashes">
+            {% for category, msg in messages %}
+              <div class="alert alert-{{category}}">{{ msg }}</div>
+            {% endfor %}
+          </div>
         {% endif %}
       {% endwith %}
       {% block content %}{% endblock %}

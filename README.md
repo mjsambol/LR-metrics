@@ -38,7 +38,7 @@ Replace `docker.io/msambol/lr-metrics:latest` with the appropriate image referen
 - `FLASK_SECRET` secures the web session. 
 - The mounted volume keeps your configuration and downloaded bundles between container restarts.
 
-Once running, visit http://localhost:5001 in your browser.
+Once running, visit http://localhost:5000 in your browser.
 
 Data security via the master password 
 ---------------------------------

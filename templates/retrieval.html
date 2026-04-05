@@ -73,9 +73,64 @@
         }, 1000);
       }
 
+      function renderConnectivity(payload) {
+        const connectivitySummary = document.getElementById('connectivitySummary');
+        const connectivityTargets = document.getElementById('connectivityTargets');
+        if (!connectivitySummary || !connectivityTargets) return;
+        const level = (payload && payload.level) || 'info';
+        const levelClass = level === 'danger' ? 'danger' : (level === 'warning' ? 'warning' : (level === 'success' ? 'success' : 'muted'));
+        connectivitySummary.className = `mt-2 small text-${levelClass}`;
+        connectivitySummary.textContent = (payload && payload.message) || 'Connectivity check unavailable.';
+        const targets = (payload && payload.targets) || [];
+        if (!targets.length) {
+          connectivityTargets.innerHTML = '';
+          return;
+        }
+        const failed = targets.filter(t => !t.ok);
+        if (!failed.length) {
+          connectivityTargets.innerHTML = '';
+          return;
+        }
+        connectivityTargets.innerHTML = failed.slice(0, 8).map(t => {
+          const host = t.host || 'invalid-host';
+          const kind = t.kind || 'target';
+          const id = t.id || 'unknown';
+          const reason = t.reason || 'unreachable';
+          return `<div class="text-danger">- ${kind}:${id} (${host}) - ${reason}</div>`;
+        }).join('');
+      }
+
+      async function runConnectivityCheck() {
+        const connectivityBtn = document.getElementById('btnConnectivityCheck');
+        const connectivitySummary = document.getElementById('connectivitySummary');
+        const connectivityTargets = document.getElementById('connectivityTargets');
+        if (connectivityTargets) connectivityTargets.innerHTML = '';
+        if (connectivityBtn) connectivityBtn.disabled = true;
+        if (connectivitySummary) {
+          connectivitySummary.className = 'mt-2 small text-muted';
+          connectivitySummary.textContent = 'Checking connectivity…';
+        }
+        try {
+          const res = await fetch(withV2('/connectivity-check'));
+          const payload = await res.json();
+          renderConnectivity(payload);
+        } catch (e) {
+          if (connectivitySummary) {
+            connectivitySummary.className = 'mt-2 small text-danger';
+            connectivitySummary.textContent = 'Connectivity check failed to run.';
+          }
+        } finally {
+          if (connectivityBtn) connectivityBtn.disabled = false;
+        }
+      }
+
       if (form) {
         form.addEventListener('submit', async function(ev){
           ev.preventDefault();
+          const pageFlashes = document.getElementById('lrPageFlashes');
+          if (pageFlashes) pageFlashes.remove();
+          const prevSummary = document.getElementById('fetchSummarySection');
+          if (prevSummary) prevSummary.remove();
           setLoading(true);
           try {
             const res = await fetch(withV2('/retrieve/start'), { method: 'POST' });
@@ -93,11 +148,16 @@
           }
         });
       }
-
       const activeJobId = activeJobIdEl ? activeJobIdEl.getAttribute('data-job-id') : '';
       if (activeJobId) {
         startPolling(activeJobId);
       }
+      window.addEventListener('load', function(){
+        const connectivityBtn = document.getElementById('btnConnectivityCheck');
+        if (connectivityBtn) {
+          connectivityBtn.addEventListener('click', runConnectivityCheck);
+        }
+      });
     })();
   </script>
 </div>
@@ -113,7 +173,7 @@
   </div>
 
 {% if results and results|length > 0 %}
-  <div class="mb-3">
+  <div id="fetchSummarySection" class="mb-3">
     <h5 class="mb-2">Fetch Summary</h5>
     <ul class="list-group">
     {% for r in results %}
@@ -179,7 +239,12 @@
     {% endfor %}
   </div>
   <div class="grid-right grid-row-1" id="right-download">
-    <a class="btn btn-outline-secondary btn-sm" href="{{ v2_path('/export') }}">Download bundles and summaries</a>
+    <div class="d-flex flex-wrap gap-2 align-items-center">
+      <a class="btn btn-outline-secondary btn-sm" href="{{ v2_path('/export') }}">Download bundles and summaries</a>
+      <button id="btnConnectivityCheck" type="button" class="btn btn-outline-secondary btn-sm">Re-check connectivity</button>
+    </div>
+    <div id="connectivitySummary" class="small mt-2"></div>
+    <div id="connectivityTargets" class="small mt-1"></div>
   </div>
 
   {% if gh_reports and gh_reports|length > 0 %}
